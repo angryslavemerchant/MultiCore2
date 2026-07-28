@@ -209,7 +209,8 @@ def add_to_blacklist(machine_id: int):
     BLACKLIST.write_text(json.dumps(sorted(bl)))
 
 
-def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 40):
+def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 40,
+                  num_gpus: int = 1):
     # No reliability filter (user: doesn't matter). cuda>=12.8 for Blackwell.
     # cpu_ram>=48: the RAM-blob loader holds the 25 GB train blob in system
     # RAM (on 32 GB cards the dataset can't live in VRAM).
@@ -225,9 +226,12 @@ def search_offers(gpu: str, max_dph: float, inet: int = 500, limit: int = 40):
     # end. The boot health gate is the real protection against a host driver
     # too old for the image (CUDA error 804), and it destroys such machines
     # itself, so the filter was redundant as well as broken.
-    query = (f"gpu_name={gpu} num_gpus=1 rentable=true verified=true "
+    # multi-GPU: RAM/core needs scale with ranks (each DDP rank runs its own
+    # dataloader over the shared memmap; 4 GB + 2 cores per rank is ample)
+    query = (f"gpu_name={gpu} num_gpus={num_gpus} rentable=true verified=true "
              f"inet_down>={inet} disk_space>={DISK_GB} "
-             f"cpu_cores_effective>=4 cpu_ram>=16 dph<={max_dph}")
+             f"cpu_cores_effective>={max(4, 2 * num_gpus)} "
+             f"cpu_ram>={max(16, 4 * num_gpus)} dph<={max_dph}")
     offers = vast("search", "offers", query, "-o", "dph")
     if not isinstance(offers, list):
         return []
@@ -729,6 +733,10 @@ def main():
                         help="override the profile's price cap")
         sp.add_argument("--inet",    type=int,   default=500)
         sp.add_argument("--branch",  type=str,   default="main")
+        sp.add_argument("--num-gpus", type=int, default=1, dest="num_gpus",
+                        help="GPUs per machine in the offer search; pair "
+                             "with --max-dph (caps are per-offer, not "
+                             "per-GPU) and launch with --nproc")
 
     sp = sub.add_parser("search");  common(sp); sp.set_defaults(fn=cmd_search)
 
