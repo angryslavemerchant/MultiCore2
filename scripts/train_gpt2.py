@@ -248,8 +248,11 @@ def main():
 
     def upload_ckpt(alias):
         import wandb
+        # type must match vast/upload_results.py, which appends the final
+        # version to the SAME artifact name — wandb forbids reusing a name
+        # with a different type (found by the 2026-07-28 cloud smoke).
         art = wandb.Artifact(
-            f"{wandb.run.project}-{wandb.run.id}", type="checkpoint")
+            f"{wandb.run.project}-{wandb.run.id}", type="model")
         art.add_file(ckpt_path)
         wandb.log_artifact(art, aliases=[alias])
 
