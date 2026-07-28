@@ -75,7 +75,6 @@ def main():
             gate = att.router(acts[i]).argmax(-1)
             d = gated_death_times(gate, att.capacity)
             keys = interval_mask(d, T)[:, 0].float().sum(-1).mean()
-            densities[i] = float(keys)
             print(f"layer {i:2d}: gated mean visible keys/query "
                   f"{keys:7.1f}  (swa reference {float(swa_keys):.1f})")
 
