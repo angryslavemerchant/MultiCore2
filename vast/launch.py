@@ -1,5 +1,5 @@
-"""
-vast/launch.py â€” local orchestrator for Vast.ai training runs.
+﻿"""
+vast/launch.py Ã¢â‚¬â€ local orchestrator for Vast.ai training runs.
 
 Runs on the local machine (Windows: use the Anaconda python). Wraps the
 `vastai` CLI; reads secrets from vast/secrets.env (gitignored). State about
@@ -77,7 +77,7 @@ TEMPLATE_ENV = (
 DISK_GB   = 100
 
 # MultiCore2 trains a 124M GPT-2 on cached tokens: unlike SmallCore this IS
-# FLOP-bound, so GPU class is the whole story again — rent 4090/5090-class
+# FLOP-bound, so GPU class is the whole story again â€” rent 4090/5090-class
 # compute, and the boot gate (thresholds_gpt2.json) enforces real bf16
 # throughput rather than the broken-hardware floors.
 GPU_PROFILES = {
@@ -101,7 +101,7 @@ BASE_TRAIN_ARGS = "--wandb"
 
 
 def resolve_profile(args):
-    """(profile dict, gpu_name, max_dph) — CLI --gpu/--max-dph override."""
+    """(profile dict, gpu_name, max_dph) â€” CLI --gpu/--max-dph override."""
     prof = GPU_PROFILES[args.profile]
     gpu = args.gpu or prof["gpu_name"]
     max_dph = args.max_dph if args.max_dph is not None else prof["max_dph"]
@@ -112,8 +112,8 @@ def _find_vastai():
     """The vastai CLI, wherever pip put it.
 
     `shutil.which` misses it on Windows whenever the interpreter's Scripts
-    directory is not on PATH — which is the normal state for a conda base env
-    — so fall back to the Scripts dir of the interpreter actually running this
+    directory is not on PATH â€” which is the normal state for a conda base env
+    â€” so fall back to the Scripts dir of the interpreter actually running this
     file. The old hard-coded ToastEnv path went stale when that env was
     removed, and the failure looked like a vast outage rather than a missing
     binary.
@@ -139,7 +139,7 @@ VASTAI = _find_vastai()
 
 def load_secrets() -> dict:
     if not SECRETS.exists():
-        sys.exit(f"Missing {SECRETS} â€” create it with VAST_API_KEY, "
+        sys.exit(f"Missing {SECRETS} Ã¢â‚¬â€ create it with VAST_API_KEY, "
                  "WANDB_API_KEY, HF_TOKEN lines.")
     out = {}
     for line in SECRETS.read_text().splitlines():
@@ -187,9 +187,9 @@ def resolve_id(args) -> int:
     if len(live) == 1:
         return live[0]["id"]
     if not live:
-        sys.exit("No tracked instances â€” pass --id (see `status`).")
+        sys.exit("No tracked instances Ã¢â‚¬â€ pass --id (see `status`).")
     ids = ", ".join(str(r["id"]) for r in live)
-    sys.exit(f"Multiple tracked instances ({ids}) â€” pass --id.")
+    sys.exit(f"Multiple tracked instances ({ids}) Ã¢â‚¬â€ pass --id.")
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ def _is_server_cpu(o: dict) -> bool:
 
 def pick_offer(offers: list):
     """
-    Not the cheapest â€” the bottom of the price range is where the lemons
+    Not the cheapest Ã¢â‚¬â€ the bottom of the price range is where the lemons
     live (learned the hard way: 3 of the 4 cheapest hosts in a row failed
     to boot or run CUDA). Pick near the middle of the price distribution,
     preferring consumer CPUs (Ryzen/Core), which are generally faster per
@@ -282,9 +282,9 @@ def fmt_offer(o: dict) -> str:
 
 def cmd_search(args):
     prof, gpu, max_dph = resolve_profile(args)
-    offers = search_offers(gpu, max_dph, args.inet)
+    offers = search_offers(gpu, max_dph, args.inet, num_gpus=getattr(args, "num_gpus", 1))
     if not offers:
-        print("No offers matched â€” relax --max-dph or --inet.")
+        print("No offers matched Ã¢â‚¬â€ relax --max-dph or --inet.")
         return
     print(f"Top {len(offers)} offers for {gpu} (profile {args.profile}, "
           f"cap ${max_dph}/hr):")
@@ -311,7 +311,7 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
     if keep_alive:
         exports.append("export KEEP_ALIVE=1")
     # Run our provisioning in the background and hand the foreground to the
-    # template's own entrypoint.sh (portal/jupyter/workspace setup) â€” do NOT
+    # template's own entrypoint.sh (portal/jupyter/workspace setup) Ã¢â‚¬â€ do NOT
     # replace it. Our output still reaches `vastai logs` via /proc/1/fd/1.
     provision = (
         f"cd /workspace && rm -rf {REPO_DIR} && "
@@ -349,7 +349,7 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
     extra = []
     if bid is not None:
         # INTERRUPTIBLE. `--bid` turns the rental into a spot bid: outbid means
-        # the instance is STOPPED, not destroyed, and its disk survives — but
+        # the instance is STOPPED, not destroyed, and its disk survives â€” but
         # vast's own guidance is that the wait to resume can be long, and the
         # GPU can be taken on-demand by someone else in the meantime. So a
         # spot run needs checkpoints that leave the box, not just checkpoints.
@@ -371,7 +371,7 @@ def create_instance(offer_id: int, secrets: dict, branch: str,
         raise RuntimeError(f"create instance failed with no contract: {result}")
     if not result.get("success"):
         print(f"WARNING: create reported success=False but returned contract "
-              f"{iid}; tracking it anyway — verify with `status`", flush=True)
+              f"{iid}; tracking it anyway â€” verify with `status`", flush=True)
 
     records = load_state()
     records.append({
@@ -393,8 +393,8 @@ def hedged_launch(args, secrets, gpu, max_dph):
     no logs and self-stopping hosts never reach the gate, so both failure
     modes lose the race silently at ~$0.05/loser instead of costing a
     35-minute diagnosis each. Losers killed just after their gate may
-    leave a crashed wandb stub — harmless."""
-    offers = search_offers(gpu, max_dph, args.inet)
+    leave a crashed wandb stub â€” harmless."""
+    offers = search_offers(gpu, max_dph, args.inet, num_gpus=getattr(args, "num_gpus", 1))
     if not offers:
         sys.exit("No offers matched the filters.")
     median_dph = statistics.median(o["dph_total"] for o in offers)
@@ -481,7 +481,7 @@ def cmd_launch(args):
 
     offer_id = args.offer
     if offer_id is None:
-        offers = search_offers(gpu, max_dph, args.inet)
+        offers = search_offers(gpu, max_dph, args.inet, num_gpus=getattr(args, "num_gpus", 1))
         offer = pick_offer(offers)
         if offer is None:
             sys.exit("No offers matched the filters.")
@@ -529,7 +529,7 @@ def extract_marker_json(logs: str, marker: str = "BENCHMARK_JSON "):
 def cmd_scan(args):
     secrets = load_secrets()
     prof, gpu, max_dph = resolve_profile(args)
-    offers = search_offers(gpu, max_dph, args.inet, limit=40)
+    offers = search_offers(gpu, max_dph, args.inet, limit=40, num_gpus=getattr(args, "num_gpus", 1))
     if len(offers) < args.n:
         sys.exit(f"Only {len(offers)} offers matched; need {args.n}.")
 
@@ -601,7 +601,7 @@ def cmd_scan(args):
         if slot["result"]:
             entry.update(slot["result"])
         else:
-            entry["error"] = "timeout â€” no benchmark received"
+            entry["error"] = "timeout Ã¢â‚¬â€ no benchmark received"
         results.append(entry)
     SCAN_OUT.write_text(json.dumps(results, indent=2))
     print(f"\nWrote {SCAN_OUT}")
@@ -613,14 +613,14 @@ def cmd_scan(args):
         print("\nResults:")
         for r in ok:
             print("  " + json.dumps(r))
-        print("\nSuggested gate thresholds (70% of median â€” update "
+        print("\nSuggested gate thresholds (70% of median Ã¢â‚¬â€ update "
               "vast/thresholds.json and push):")
         for m in metrics:
             vals = [r[m] for r in ok if m in r]
             if vals:
                 print(f'  "{m}": {round(0.7 * statistics.median(vals), 1)},')
     else:
-        print("No successful benchmarks â€” inspect logs / retry.")
+        print("No successful benchmarks Ã¢â‚¬â€ inspect logs / retry.")
 
 
 # ---------------------------------------------------------------------------
@@ -655,11 +655,11 @@ def cmd_ssh(args):
 
 def cmd_pull(args):
     """Copy the instance's runs/ folder into the local repo's runs/ via scp.
-    Instances no longer self-destroy on success — pull, verify, then destroy.
+    Instances no longer self-destroy on success â€” pull, verify, then destroy.
 
     (`vastai copy` is unusable here: it rejects Windows drive-colon paths and
     then shells out to rsync, which Windows lacks. scp from Windows OpenSSH
-    works; requires the account ssh key — `vastai create ssh-key` — which
+    works; requires the account ssh key â€” `vastai create ssh-key` â€” which
     new instances inherit at boot.)"""
     iid = resolve_id(args)
     dst = ROOT / "runs"
@@ -675,7 +675,7 @@ def cmd_pull(args):
     print(f"pulling {iid} -> {dst}")
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
-        sys.exit(f"scp failed ({proc.returncode}) — is the account ssh key "
+        sys.exit(f"scp failed ({proc.returncode}) â€” is the account ssh key "
                  f"attached to this instance? (vastai attach ssh)")
     print(f"pulled. verify contents, then: launch.py destroy --id {iid}")
 
@@ -767,7 +767,7 @@ def main():
     sp.add_argument("--bid", type=float, default=None,
                     help="INTERRUPTIBLE: bid this $/hr instead of renting "
                          "on-demand. Outbid means the instance is STOPPED "
-                         "(disk preserved), not destroyed — but vast warns "
+                         "(disk preserved), not destroyed â€” but vast warns "
                          "the wait to resume can be long and the GPU may be "
                          "taken on-demand meanwhile, so only use this with a "
                          "run that checkpoints OFF the box and auto-resumes.")
@@ -816,3 +816,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
