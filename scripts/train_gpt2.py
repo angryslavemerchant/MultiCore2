@@ -52,6 +52,13 @@ def parse_args():
     ap.add_argument("--block", default="gpt2")
     ap.add_argument("--attn", default="causal")
     ap.add_argument("--mlp", default="gelu")
+    ap.add_argument("--attn-pattern", default="",
+                    help="per-layer attention, one char per layer: F=full, "
+                         "S=sliding window, G=admission-gated. The 2:1 "
+                         "sandwich is FGGGGFFGGGGF (gated) / FSSSSFFSSSSF "
+                         "(SWA control). Empty = all layers --attn")
+    ap.add_argument("--window", type=int, default=512)
+    ap.add_argument("--n-gates", type=int, default=8)
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--dropout", type=float, default=0.0)
     # stopping rule (first non-None wins, in this order)
@@ -105,7 +112,12 @@ def parse_args():
         args.artifact_every = 0
         args.no_compile = True
     if args.run_name is None:
-        args.run_name = f"{args.scale}-{args.block}-{args.attn}-{args.mlp}"
+        if args.attn_pattern:
+            args.run_name = (f"{args.scale}-{args.attn_pattern}-w{args.window}"
+                             + (f"-g{args.n_gates}"
+                                if "G" in args.attn_pattern else ""))
+        else:
+            args.run_name = f"{args.scale}-{args.block}-{args.attn}-{args.mlp}"
     return args
 
 
@@ -138,7 +150,8 @@ def main():
     assert args.seq_len <= block_size
     cfg = GPTConfig(block_size=block_size, vocab_size=VOCAB_SIZE,
                     dropout=args.dropout, block=args.block, attn=args.attn,
-                    mlp=args.mlp, **scale)
+                    mlp=args.mlp, attn_pattern=args.attn_pattern,
+                    window=args.window, n_gates=args.n_gates, **scale)
     model = GPT(cfg).to(device)
     n_params = model.num_params()
     fpt = model.flops_per_token(args.seq_len)
@@ -224,17 +237,34 @@ def main():
                           stride=world)
 
     def val_loss():
+        """Mean eval loss, plus per-gated-layer router stats (collected on
+        the last eval batch only — one batch of occupancy is representative
+        and keeps the stats hook out of the hot path)."""
+        from core.gated_swa import GatedSWAttention
+        gated = [(i, blk.attn) for i, blk in enumerate(raw_model.transformer.h)
+                 if isinstance(blk.attn, GatedSWAttention)]
         raw_model.eval()
         losses = []
         ev = data.batches(B, T, device, seed=0, split="eval")
         with torch.no_grad():
-            for _ in range(args.eval_iters):
+            for it in range(args.eval_iters):
+                if it == args.eval_iters - 1:
+                    for _, m in gated:
+                        m.collect_stats = True
                 w = next(ev)
                 with amp:
                     _, loss = raw_model(w[:, :-1], w[:, 1:])
                 losses.append(loss.item())
+        stats = {}
+        for i, m in gated:
+            m.collect_stats = False
+            s = m.stats
+            stats[f"gates/L{i}/max_frac"] = float(s["gate_frac"].max())
+            stats[f"gates/L{i}/entropy"] = s["router_entropy"]
+            stats[f"gates/L{i}/mean_lifetime"] = s["mean_lifetime"]
+            stats[f"gates/L{i}/frac_evicted"] = s["frac_evicted"]
         raw_model.train()
-        return float(np.mean(losses))
+        return float(np.mean(losses)), stats
 
     def save(step, best):
         os.makedirs(run_dir, exist_ok=True)
@@ -305,7 +335,7 @@ def main():
                           step=done)
 
         if master and (done % args.eval_every == 0 or done == iters):
-            vl = val_loss()
+            vl, gate_stats = val_loss()
             best_val = min(best_val, vl)
             print(f"[train] step {done} VAL {vl:.4f} (best {best_val:.4f})",
                   flush=True)
@@ -322,7 +352,8 @@ def main():
                            "config": config_dict(cfg)}, f, indent=2)
             if use_wandb:
                 import wandb
-                wandb.log({"val/loss": vl, "val/best": best_val}, step=done)
+                wandb.log({"val/loss": vl, "val/best": best_val,
+                           **gate_stats}, step=done)
             t_last = time.time()          # don't bill eval time to the iter
 
         if (use_wandb and args.artifact_every

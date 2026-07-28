@@ -38,8 +38,24 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True          # GPT-2 has biases everywhere
     block: str = "gpt2"        # BLOCKS registry key
-    attn: str = "causal"       # ATTENTIONS registry key
+    attn: str = "causal"       # ATTENTIONS registry key (all layers...)
     mlp: str = "gelu"          # MLPS registry key
+    # ...unless attn_pattern is set: one char per layer, F=full causal,
+    # S=sliding window, G=admission-gated window. E.g. the 2:1 sandwich
+    # "FGGGGFFGGGGF". Empty = every layer uses cfg.attn.
+    attn_pattern: str = ""
+    window: int = 512          # total window budget for S and G layers
+    n_gates: int = 8           # G layers: FIFO gates of capacity window/n_gates
+
+    def layer_attns(self):
+        """Per-layer ATTENTIONS keys, resolving attn_pattern."""
+        if not self.attn_pattern:
+            return [self.attn] * self.n_layer
+        assert len(self.attn_pattern) == self.n_layer, (
+            f"attn_pattern {self.attn_pattern!r} has "
+            f"{len(self.attn_pattern)} chars for {self.n_layer} layers")
+        key = {"F": self.attn, "S": "swa", "G": "gated"}
+        return [key[c] for c in self.attn_pattern]
 
 
 class CausalSelfAttention(nn.Module):
@@ -83,10 +99,10 @@ class GeluMLP(nn.Module):
 class Block(nn.Module):
     """Pre-LN transformer block: x + attn(ln(x)), then x + mlp(ln(x))."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, attn_key=None):
         super().__init__()
         self.ln_1 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
-        self.attn = ATTENTIONS[cfg.attn](cfg)
+        self.attn = ATTENTIONS[attn_key or cfg.attn](cfg)
         self.ln_2 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
         self.mlp = MLPS[cfg.mlp](cfg)
 
@@ -96,8 +112,12 @@ class Block(nn.Module):
         return x
 
 
+from core.gated_swa import SlidingWindowAttention, GatedSWAttention  # noqa: E402
+
 # The seams. The new architecture adds entries here; the config selects them.
-ATTENTIONS = {"causal": CausalSelfAttention}
+ATTENTIONS = {"causal": CausalSelfAttention,
+              "swa": SlidingWindowAttention,
+              "gated": GatedSWAttention}
 MLPS = {"gelu": GeluMLP}
 BLOCKS = {"gpt2": Block}
 
@@ -110,8 +130,8 @@ class GPT(nn.Module):
             wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
             wpe=nn.Embedding(cfg.block_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
-            h=nn.ModuleList(BLOCKS[cfg.block](cfg)
-                            for _ in range(cfg.n_layer)),
+            h=nn.ModuleList(BLOCKS[cfg.block](cfg, attn_key=key)
+                            for key in cfg.layer_attns()),
             ln_f=nn.LayerNorm(cfg.n_embd, bias=cfg.bias),
         ))
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
@@ -160,13 +180,24 @@ class GPT(nn.Module):
 
     def flops_per_token(self, T=None):
         """Analytic fwd+bwd FLOPs per trained token (nanoGPT convention):
-        6*N for the matmuls plus 12*L*d*T for attention scores at sequence
-        length T. This number times tokens-consumed is the compute-matching
-        currency between the baseline and any variant; a variant with a
-        different per-token cost must override it."""
+        6*N for the matmuls plus 12*d*keys for attention scores per layer.
+        Full layers average (T+1)/2 causal keys... no — the 12*L*d*T
+        convention already folds the causal 1/2 into its constant, so we
+        keep T for full layers and swap in the windowed layers' actual
+        average visible-key count, avg_t min(t, W): windowed and gated
+        layers touch at most W keys per query (the gated union is exactly
+        the same <=W budget). This number times tokens-consumed is the
+        compute-matching currency between arms; router matmuls (d*G) are
+        ~0.005% and ignored."""
         T = T or self.cfg.block_size
-        return (6 * self.num_params()
-                + 12 * self.cfg.n_layer * self.cfg.n_embd * T)
+        W = self.cfg.window
+        # mean over t in [1..T] of min(t, W), the visible keys of a
+        # windowed layer at training shape T
+        win_keys = T if T <= W else (W * (W + 1) / 2 + (T - W) * W) / T
+        score = sum(12 * self.cfg.n_embd * (T if k == self.cfg.attn
+                                            else win_keys)
+                    for k in self.cfg.layer_attns())
+        return 6 * self.num_params() + score
 
     def configure_optimizers(self, weight_decay, lr, betas, device_type):
         """AdamW with weight decay on >=2D params only (no decay on biases,
