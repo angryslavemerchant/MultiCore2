@@ -59,6 +59,13 @@ def parse_args():
                          "(SWA control). Empty = all layers --attn")
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--n-gates", type=int, default=8)
+    ap.add_argument("--recent-band", type=int, default=0,
+                    help="G layers: guaranteed-visible recent tokens out of "
+                         "--window; gates share the rest. Phase-1's pure "
+                         "gates lost 0.04 nats to recency starvation")
+    ap.add_argument("--pos", default="learned", choices=("learned", "rope"),
+                    help="rope has no position params and is the "
+                         "long-context default")
     ap.add_argument("--lb-coef", type=float, default=0.01,
                     help="router load-balance aux weight (G layers only; "
                          "the router measurably collapses at init without "
@@ -119,9 +126,15 @@ def parse_args():
         if args.attn_pattern:
             args.run_name = (f"{args.scale}-{args.attn_pattern}-w{args.window}"
                              + (f"-g{args.n_gates}"
-                                if "G" in args.attn_pattern else ""))
+                                if "G" in args.attn_pattern else "")
+                             + (f"-r{args.recent_band}"
+                                if args.recent_band else ""))
         else:
             args.run_name = f"{args.scale}-{args.block}-{args.attn}-{args.mlp}"
+        if args.pos == "rope":
+            args.run_name += "-rope"
+        if args.seq_len != 1024:
+            args.run_name += f"-t{args.seq_len}"
     return args
 
 
@@ -150,12 +163,12 @@ def main():
 
     # ------------------------------------------------------------ model
     scale = dict(SCALES[args.scale])
-    block_size = scale.pop("block_size", 1024)
-    assert args.seq_len <= block_size
+    block_size = max(scale.pop("block_size", 1024), args.seq_len)
     cfg = GPTConfig(block_size=block_size, vocab_size=VOCAB_SIZE,
                     dropout=args.dropout, block=args.block, attn=args.attn,
                     mlp=args.mlp, attn_pattern=args.attn_pattern,
                     window=args.window, n_gates=args.n_gates,
+                    recent_band=args.recent_band, pos=args.pos,
                     lb_coef=args.lb_coef if "G" in args.attn_pattern else 0.0,
                     **scale)
     model = GPT(cfg).to(device)
@@ -242,15 +255,21 @@ def main():
                           skip=start_step * grad_accum * world + rank,
                           stride=world)
 
+    # position-bucket edges for val loss: at long context the aggregate
+    # dilutes the long-range signal — the discriminating readout is loss at
+    # positions far beyond the window vs inside it
+    BUCKETS = [e for e in (0, 256, 512, 1024, 2048, 4096) if e < T] + [T]
+
     def val_loss():
-        """Mean eval loss, plus per-gated-layer router stats (collected on
-        the last eval batch only — one batch of occupancy is representative
-        and keeps the stats hook out of the hot path)."""
+        """(mean eval loss, stats dict) — stats carry per-gated-layer router
+        panels plus per-position-bucket loss."""
+        from torch.nn import functional as F
         from core.gated_swa import GatedSWAttention
         gated = [(i, blk.attn) for i, blk in enumerate(raw_model.transformer.h)
                  if isinstance(blk.attn, GatedSWAttention)]
         raw_model.eval()
-        losses = []
+        tok_sum = torch.zeros(len(BUCKETS) - 1, dtype=torch.float64)
+        tok_cnt = torch.zeros(len(BUCKETS) - 1, dtype=torch.float64)
         ev = data.batches(B, T, device, seed=0, split="eval")
         with torch.no_grad():
             for it in range(args.eval_iters):
@@ -258,10 +277,20 @@ def main():
                     for _, m in gated:
                         m.collect_stats = True
                 w = next(ev)
+                x, y = w[:, :-1], w[:, 1:]
                 with amp:
-                    _, loss = raw_model(w[:, :-1], w[:, 1:])
-                losses.append(loss.item())
+                    logits, _ = raw_model(x, y)
+                lt = F.cross_entropy(
+                    logits.float().view(-1, logits.size(-1)),
+                    y.reshape(-1), reduction="none").view(x.shape[0], T)
+                for bi in range(len(BUCKETS) - 1):
+                    seg = lt[:, BUCKETS[bi]:BUCKETS[bi + 1]]
+                    tok_sum[bi] += float(seg.sum())
+                    tok_cnt[bi] += seg.numel()
         stats = {}
+        for bi in range(len(BUCKETS) - 1):
+            stats[f"val/pos_{BUCKETS[bi]}-{BUCKETS[bi + 1]}"] = \
+                float(tok_sum[bi] / tok_cnt[bi])
         for i, m in gated:
             m.collect_stats = False
             s = m.stats
@@ -270,7 +299,7 @@ def main():
             stats[f"gates/L{i}/mean_lifetime"] = s["mean_lifetime"]
             stats[f"gates/L{i}/frac_evicted"] = s["frac_evicted"]
         raw_model.train()
-        return float(np.mean(losses)), stats
+        return float(tok_sum.sum() / tok_cnt.sum()), stats
 
     def save(step, best):
         os.makedirs(run_dir, exist_ok=True)

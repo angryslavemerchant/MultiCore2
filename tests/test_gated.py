@@ -142,6 +142,60 @@ def test_pattern_flops_ordering():
                - (f_swa - 6 * swa.num_params())) < 1e-6
 
 
+def test_hybrid_recent_band_always_visible():
+    """With recent_band=R, the last R tokens are visible to every query no
+    matter how the router behaves, and gates only manage window - R."""
+    cfg = GPTConfig(block_size=128, vocab_size=53, n_layer=1, n_head=2,
+                    n_embd=32, attn_pattern="G", window=32, n_gates=4,
+                    recent_band=16)
+    model = GPT(cfg)
+    att = model.transformer.h[0].attn
+    assert att.capacity == 4                       # (32-16)/4
+    T, R = 128, 16
+    gates = torch.randint(0, 4, (2, T))
+    death = gated_death_times(gates, att.capacity)
+    death = torch.maximum(death, torch.arange(T) + R)
+    mask = interval_mask(death, T)[:, 0]
+    q = torch.arange(T).view(T, 1)
+    k = torch.arange(T).view(1, T)
+    recent = (k <= q) & (q - k < R)
+    assert bool(mask[:, recent].all())
+    # budget: visible keys never exceed window
+    assert int(mask.sum(-1).max()) <= cfg.window
+
+
+def test_rope_model_no_leak_and_no_wpe():
+    """RoPE model must have no wpe parameters and stay causal end to end."""
+    cfg = GPTConfig(block_size=64, vocab_size=97, n_layer=2, n_head=2,
+                    n_embd=32, attn_pattern="FG", window=8, n_gates=2,
+                    pos="rope")
+    model = GPT(cfg).eval()
+    assert not hasattr(model.transformer, "wpe")
+    t = 40
+    idx = torch.randint(0, 97, (2, 64))
+    idx2 = idx.clone()
+    idx2[:, t + 1:] = torch.randint(0, 97, (2, 64 - t - 1))
+    with torch.no_grad():
+        a, _ = model(idx, idx)
+        b, _ = model(idx2, idx2)
+    assert torch.allclose(a[:, :t + 1], b[:, :t + 1], atol=1e-5)
+
+
+def test_rope_scores_are_relative():
+    """RoPE's defining property: with the same q/k vector planted at every
+    position, score(i, j) depends only on i - j — equal offsets match,
+    different offsets differ."""
+    from core.rope import apply_rope
+    T, hd = 32, 16
+    q = torch.randn(hd).repeat(1, 1, T, 1)     # same vector, all positions
+    k = torch.randn(hd).repeat(1, 1, T, 1)
+    rq, rk = apply_rope(q, k)
+    S = (rq @ rk.transpose(-1, -2))[0, 0]      # (T, T)
+    assert torch.allclose(S[5, 3], S[10, 8], atol=1e-5)     # same offset 2
+    assert torch.allclose(S[20, 5], S[27, 12], atol=1e-5)   # same offset 15
+    assert not torch.allclose(S[5, 3], S[5, 1], atol=1e-4)  # offset 2 vs 4
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_flex_matches_dense_path():
     """The flex_attention fast path must agree with the dense-mask SDPA

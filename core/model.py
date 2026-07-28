@@ -45,8 +45,16 @@ class GPTConfig:
     # "FGGGGFFGGGGF". Empty = every layer uses cfg.attn.
     attn_pattern: str = ""
     window: int = 512          # total window budget for S and G layers
-    n_gates: int = 8           # G layers: FIFO gates of capacity window/n_gates
+    n_gates: int = 8           # G layers: FIFO gates share (window - recent_band)
     lb_coef: float = 0.0       # weight of the router load-balance aux loss
+    # G layers: reserve this many of `window` as a GUARANTEED recent band
+    # (plain sliding visibility); the gates manage only the remainder.
+    # Phase-1 lesson (2026-07-28): pure gates guarantee just window/n_gates
+    # recent tokens and lost 0.04 nats to recency starvation at T=1024.
+    recent_band: int = 0
+    # "learned" = GPT-2 wpe (capped at block_size); "rope" = rotary, no
+    # position parameters — the phase-2 long-context default.
+    pos: str = "learned"
 
     def layer_attns(self):
         """Per-layer ATTENTIONS keys, resolving attn_pattern."""
@@ -66,6 +74,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.n_embd = cfg.n_embd
         self.dropout = cfg.dropout
+        self.use_rope = cfg.pos == "rope"
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
@@ -77,6 +86,9 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        if self.use_rope:
+            from core.rope import apply_rope
+            q, k = apply_rope(q, k)
         y = F.scaled_dot_product_attention(
             q, k, v, is_causal=True,
             dropout_p=self.dropout if self.training else 0.0)
@@ -126,15 +138,18 @@ BLOCKS = {"gpt2": Block}
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
+        assert cfg.pos in ("learned", "rope"), cfg.pos
         self.cfg = cfg
-        self.transformer = nn.ModuleDict(dict(
+        modules = dict(
             wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
-            wpe=nn.Embedding(cfg.block_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
             h=nn.ModuleList(BLOCKS[cfg.block](cfg, attn_key=key)
                             for key in cfg.layer_attns()),
             ln_f=nn.LayerNorm(cfg.n_embd, bias=cfg.bias),
-        ))
+        )
+        if cfg.pos == "learned":
+            modules["wpe"] = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.transformer = nn.ModuleDict(modules)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight   # tied
 
@@ -157,9 +172,11 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
         assert T <= self.cfg.block_size
-        pos = torch.arange(T, device=idx.device)
-        x = self.transformer.drop(
-            self.transformer.wte(idx) + self.transformer.wpe(pos))
+        x = self.transformer.wte(idx)
+        if self.cfg.pos == "learned":
+            pos = torch.arange(T, device=idx.device)
+            x = x + self.transformer.wpe(pos)
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -182,7 +199,7 @@ class GPT(nn.Module):
         """Parameter count. `non_embedding` drops wpe (wte stays: it is tied
         to lm_head, which does real compute)."""
         n = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and self.cfg.pos == "learned":
             n -= self.transformer.wpe.weight.numel()
         return n
 

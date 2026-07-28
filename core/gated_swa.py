@@ -143,6 +143,7 @@ class SlidingWindowAttention(nn.Module):
         self.n_head = cfg.n_head
         self.window = cfg.window
         self.dropout = cfg.dropout
+        self.use_rope = cfg.pos == "rope"
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
@@ -156,8 +157,13 @@ class SlidingWindowAttention(nn.Module):
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(C, dim=2)
         shp = (B, T, self.n_head, C // self.n_head)
-        return (q.view(shp).transpose(1, 2), k.view(shp).transpose(1, 2),
-                v.view(shp).transpose(1, 2))
+        q = q.view(shp).transpose(1, 2)
+        k = k.view(shp).transpose(1, 2)
+        v = v.view(shp).transpose(1, 2)
+        if self.use_rope:
+            from core.rope import apply_rope
+            q, k = apply_rope(q, k)
+        return q, k, v
 
     def forward(self, x):
         B, T, C = x.shape
@@ -175,10 +181,14 @@ class GatedSWAttention(SlidingWindowAttention):
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        assert cfg.window % cfg.n_gates == 0, (
-            f"window {cfg.window} not divisible by n_gates {cfg.n_gates}")
+        assert 0 <= cfg.recent_band < cfg.window, cfg.recent_band
+        gate_budget = cfg.window - cfg.recent_band
+        assert gate_budget % cfg.n_gates == 0, (
+            f"gate budget {gate_budget} (window {cfg.window} - recent_band "
+            f"{cfg.recent_band}) not divisible by n_gates {cfg.n_gates}")
         self.n_gates = cfg.n_gates
-        self.capacity = cfg.window // cfg.n_gates
+        self.recent_band = cfg.recent_band
+        self.capacity = gate_budget // cfg.n_gates
         self.router = nn.Linear(cfg.n_embd, cfg.n_gates, bias=False)
         self.collect_stats = False   # set by eval code; read after forward
         self.stats = {}
@@ -208,6 +218,13 @@ class GatedSWAttention(SlidingWindowAttention):
         v = v * scale.unsqueeze(1)                    # broadcast over heads
 
         death = gated_death_times(gate, self.capacity)
+        if self.recent_band:
+            # Hybrid budget (phase-1 lesson): the last `recent_band` tokens
+            # are unconditionally visible — max() keeps every key's
+            # visibility a single [k, death') interval, so the mask stays a
+            # jagged sliding window and no kernel structure changes.
+            death = torch.maximum(
+                death, torch.arange(T, device=x.device) + self.recent_band)
         y = _attend(q, k, v, death,
                     self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
