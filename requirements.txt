@@ -1,0 +1,11 @@
+# torch is NOT listed: it comes from the vast.ai image (/venv/main) or the
+# local conda env. Reinstalling it on-instance wastes 10+ minutes.
+numpy
+wandb
+# hub download + parquet decode for the token-cache builder (the normal path
+# never runs it on-instance — the finished cache is pulled from the Drive
+# bank — but a bank outage must cost minutes of CPU, not the run).
+huggingface_hub
+pyarrow
+# GPT-NeoX tokenizer: builds the uint16 token cache and decodes samples.
+transformers
