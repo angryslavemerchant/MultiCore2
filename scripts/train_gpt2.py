@@ -59,6 +59,10 @@ def parse_args():
                          "(SWA control). Empty = all layers --attn")
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--n-gates", type=int, default=8)
+    ap.add_argument("--lb-coef", type=float, default=0.01,
+                    help="router load-balance aux weight (G layers only; "
+                         "the router measurably collapses at init without "
+                         "it). 0 disables")
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--dropout", type=float, default=0.0)
     # stopping rule (first non-None wins, in this order)
@@ -151,7 +155,9 @@ def main():
     cfg = GPTConfig(block_size=block_size, vocab_size=VOCAB_SIZE,
                     dropout=args.dropout, block=args.block, attn=args.attn,
                     mlp=args.mlp, attn_pattern=args.attn_pattern,
-                    window=args.window, n_gates=args.n_gates, **scale)
+                    window=args.window, n_gates=args.n_gates,
+                    lb_coef=args.lb_coef if "G" in args.attn_pattern else 0.0,
+                    **scale)
     model = GPT(cfg).to(device)
     n_params = model.num_params()
     fpt = model.flops_per_token(args.seq_len)

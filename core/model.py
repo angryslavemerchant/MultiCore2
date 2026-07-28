@@ -46,6 +46,7 @@ class GPTConfig:
     attn_pattern: str = ""
     window: int = 512          # total window budget for S and G layers
     n_gates: int = 8           # G layers: FIFO gates of capacity window/n_gates
+    lb_coef: float = 0.0       # weight of the router load-balance aux loss
 
     def layer_attns(self):
         """Per-layer ATTENTIONS keys, resolving attn_pattern."""
@@ -167,6 +168,13 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                targets.reshape(-1))
+        # Aux term only while TRAINING: val loss is the cross-arm judge and
+        # must stay pure cross-entropy for every architecture.
+        if self.cfg.lb_coef > 0 and self.training:
+            lb = [b.attn.lb_loss for b in self.transformer.h
+                  if getattr(b.attn, "lb_loss", None) is not None]
+            if lb:
+                loss = loss + self.cfg.lb_coef * torch.stack(lb).mean()
         return logits, loss
 
     # ------------------------------------------------------------- accounting

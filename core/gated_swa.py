@@ -90,17 +90,32 @@ def interval_mask(death, T):
     return ((k <= q) & (q < death.view(-1, 1, T))).unsqueeze(1)
 
 
+def _build_block_mask(death, B, T, device):
+    """BlockMask for `k <= q < death[b,k]`.
+
+    @torch.compiler.disable is load-bearing: building this INSIDE a compiled
+    graph silently produces wrong masks when `death` is data-dependent
+    (router-computed) — measured max|logit diff| 1.34 vs eager on
+    torch 2.12/cu130, while static SWA death times compiled fine. Building
+    it eagerly and passing it into the graph is the documented-safe pattern;
+    the BlockMask's tensor shapes are static so it does not retrigger
+    compilation.
+    """
+    def mask_mod(b, h, qi, ki):
+        return (ki <= qi) & (qi < death[b, ki])
+
+    return create_block_mask(mask_mod, B, 1, T, T, device=str(device))
+
+
+if _HAVE_FLEX:
+    _build_block_mask = torch.compiler.disable(_build_block_mask)
+
+
 def _attend(q, k, v, death, dropout_p):
     """Dispatch to flex_attention (skips dead blocks) or dense-mask SDPA."""
     B, H, T, _ = q.shape
     if USE_FLEX and _HAVE_FLEX and q.is_cuda:
-        d = death                                        # captured (B,T)
-
-        def mask_mod(b, h, qi, ki):
-            return (ki <= qi) & (qi < d[b, ki])
-
-        block_mask = create_block_mask(mask_mod, B, 1, T, T,
-                                       device=str(q.device))
+        block_mask = _build_block_mask(death, B, T, q.device)
         return flex_attention(q, k, v, block_mask=block_mask)
     return F.scaled_dot_product_attention(
         q, k, v, attn_mask=interval_mask(death, T), dropout_p=dropout_p)
@@ -153,6 +168,9 @@ class GatedSWAttention(SlidingWindowAttention):
         self.router = nn.Linear(cfg.n_embd, cfg.n_gates, bias=False)
         self.collect_stats = False   # set by eval code; read after forward
         self.stats = {}
+        self.lb_loss = None          # Switch-style load-balance term, set
+                                     # each forward; GPT.forward sums these
+                                     # when cfg.lb_coef > 0
 
     def forward(self, x):
         B, T, C = x.shape
@@ -160,6 +178,14 @@ class GatedSWAttention(SlidingWindowAttention):
         probs = F.softmax(logits.float(), dim=-1)
         gate = probs.argmax(dim=-1)                   # (B,T) hard choice
         p_sel = probs.gather(-1, gate.unsqueeze(-1))  # (B,T,1)
+
+        # Switch Transformer load balance: G * sum_g frac_g * mean_prob_g.
+        # 1.0 at perfect balance; needed here because a random router
+        # measurably collapses at init on real hidden states (occupancy up
+        # to 0.51 on one gate, measured 2026-07-28), shortening lifetimes.
+        frac = F.one_hot(gate, self.n_gates).float().mean(dim=(0, 1))
+        self.lb_loss = self.n_gates * (frac.detach()
+                                       * probs.mean(dim=(0, 1))).sum()
 
         q, k, v = self._qkv(x)
         # forward-identity multiplier: ==1.0 in fwd, routes gradient from
