@@ -26,14 +26,33 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--micro-bs", type=int, default=8)
     ap.add_argument("--seq-len", type=int, default=1024)
+    ap.add_argument("--pattern", default="FGGGGFFGGGGF")
+    ap.add_argument("--no-flex", action="store_true")
+    ap.add_argument("--compile-only", action="store_true",
+                    help="skip density stats; just the compile check")
     args = ap.parse_args()
+    if args.no_flex:
+        from core import gated_swa
+        gated_swa.USE_FLEX = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(1234)
 
     B, T = args.micro_bs, args.seq_len
-    cfg = GPTConfig(attn_pattern="FGGGGFFGGGGF", window=512, n_gates=8)
+    cfg = GPTConfig(attn_pattern=args.pattern, window=512, n_gates=8)
     model = GPT(cfg).to(device).eval()
     idx = torch.randint(0, cfg.vocab_size, (B, T), device=device)
+
+    if args.compile_only:
+        with torch.no_grad():
+            eager_logits, _ = model(idx, None)
+        cmodel = torch.compile(model)
+        with torch.no_grad():
+            comp_logits, _ = cmodel(idx, None)
+        diff = float((comp_logits - eager_logits).abs().max())
+        print(f"pattern={args.pattern} flex={not args.no_flex} "
+              f"compiled vs eager max|diff|: {diff:.4e} "
+              f"({'OK' if diff < 5e-2 else 'MISMATCH'})")
+        return
 
     # -- 1+2: real router decisions at init, via the stats hook ------------
     gated = [(i, b.attn) for i, b in enumerate(model.transformer.h)
