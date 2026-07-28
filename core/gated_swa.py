@@ -110,12 +110,25 @@ def _build_block_mask(death, B, T, device):
 if _HAVE_FLEX:
     _build_block_mask = torch.compiler.disable(_build_block_mask)
 
+# Sliding-window masks depend only on (B, T, window, device) — identical
+# every step and every S layer, so build once. Rebuilding per forward cost a
+# measurable slice of the 19% wall-clock penalty vs dense (2026-07-28 bench).
+# Gated masks are data-dependent and can never be cached.
+_STATIC_MASK_CACHE = {}
 
-def _attend(q, k, v, death, dropout_p):
+
+def _attend(q, k, v, death, dropout_p, cache_key=None):
     """Dispatch to flex_attention (skips dead blocks) or dense-mask SDPA."""
     B, H, T, _ = q.shape
     if USE_FLEX and _HAVE_FLEX and q.is_cuda:
-        block_mask = _build_block_mask(death, B, T, q.device)
+        if cache_key is not None:
+            key = (B, T, cache_key, str(q.device))
+            block_mask = _STATIC_MASK_CACHE.get(key)
+            if block_mask is None:
+                block_mask = _build_block_mask(death, B, T, q.device)
+                _STATIC_MASK_CACHE[key] = block_mask
+        else:
+            block_mask = _build_block_mask(death, B, T, q.device)
         return flex_attention(q, k, v, block_mask=block_mask)
     return F.scaled_dot_product_attention(
         q, k, v, attn_mask=interval_mask(death, T), dropout_p=dropout_p)
@@ -150,7 +163,8 @@ class SlidingWindowAttention(nn.Module):
         B, T, C = x.shape
         q, k, v = self._qkv(x)
         y = _attend(q, k, v, self._death(x),
-                    self.dropout if self.training else 0.0)
+                    self.dropout if self.training else 0.0,
+                    cache_key=("swa", self.window))
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
 
