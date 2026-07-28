@@ -1,80 +1,61 @@
+"""vast/upload_results.py — push run outputs to the Google Drive bank.
+
+wandb Artifacts abandoned 2026-07-28 (no storage on the account); metrics
+still stream to wandb, but checkpoints live on Drive:
+
+    gdrive:multicore2-runs/<run-name>/{best.pt, latest.pt, metrics.json, ...}
+
+bank.push verifies the committed remote size and raises otherwise, and this
+script exits non-zero if any push ultimately fails — run_training.sh gates
+self-destroy on that, so a Drive outage can never destroy the only copy of
+the weights. Fetch later with:
+
+    rclone copy gdrive:multicore2-runs/<run-name>/ runs/<run-name>/
 """
-vast/upload_results.py — attach eval visualisations and final checkpoints to
-the training run on wandb.
-
-Resumes the run identified by WANDB_RUN_ID (exported by run_training.sh so
-training and this step share one run), logs every PNG in --viz_dir as an
-image panel, and uploads best.pt / latest.pt (+ any --extra files, e.g. the
-benchmark JSON) as a model artifact. Download later with:
-
-    wandb artifact get <entity>/<project>/<project>-<run_id>:final
-"""
-
 import argparse
 import glob
 import os
 import sys
 import time
 
-import wandb
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from bank import push
+
+RUNS_FOLDER = "multicore2-runs"
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--viz_dir",  type=str, default="figures")
-    parser.add_argument("--ckpt_dir", type=str, default="runs")
-    parser.add_argument("--extra",    type=str, nargs="*", default=[])
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--viz_dir",  type=str, default="figures")
+    ap.add_argument("--ckpt_dir", type=str, default="runs")
+    ap.add_argument("--extra",    type=str, nargs="*", default=[])
+    args = ap.parse_args()
 
-    run = wandb.init(
-        project=os.environ.get("WANDB_PROJECT", "multicore2"),
-        id=os.environ.get("WANDB_RUN_ID"),
-        resume="allow",
-    )
+    run_name = os.path.basename(os.path.normpath(args.ckpt_dir))
+    folder = f"{RUNS_FOLDER}/{run_name}"
+    files = [os.path.join(args.ckpt_dir, n)
+             for n in ("best.pt", "latest.pt", "metrics.json")]
+    files += list(args.extra)
+    files += sorted(glob.glob(os.path.join(args.viz_dir, "*.png")))
 
-    pngs = sorted(glob.glob(os.path.join(args.viz_dir, "*.png")))
-    if pngs:
-        run.log({f"eval/{os.path.basename(p)}": wandb.Image(p) for p in pngs})
-        print(f"Logged {len(pngs)} eval image(s)")
-
-    def build_artifact():
-        # Same name as train_gpt2.py's periodic insurance uploads, so the
-        # final checkpoint lands as a new version of the same artifact.
-        artifact = wandb.Artifact(f"{run.project}-{run.id}", type="model")
-        added = False
-        for name in ("best.pt", "latest.pt"):
-            path = os.path.join(args.ckpt_dir, name)
-            if os.path.exists(path):
-                artifact.add_file(path)
-                added = True
-        for path in args.extra:
-            if os.path.exists(path):
-                artifact.add_file(path)
-        return artifact if added else None
-
-    # The instance SELF-DESTROYS on this script's success, so the upload
-    # must be VERIFIED before we exit 0: log_artifact is async and failed
-    # silently during the 2026-07-15 storage outage — .wait() blocks until
-    # the artifact is actually committed and raises otherwise. On final
-    # failure exit non-zero so run_training.sh keeps the instance alive
-    # (AWAITING_PULL fallback) instead of destroying the only copy.
-    if build_artifact() is not None:
-        for attempt in range(6):
+    pushed, failed = 0, 0
+    for p in files:
+        if not os.path.exists(p):
+            continue
+        for attempt in range(1, 4):
             try:
-                logged = run.log_artifact(build_artifact(), aliases=["final"])
-                logged.wait()
-                print("Checkpoint artifact uploaded and verified")
+                push(p, folder=folder)
+                pushed += 1
                 break
             except Exception as e:
-                if attempt == 5:
-                    run.finish()
-                    sys.exit(f"artifact upload failed after retries: {e!r}")
-                wait = min(300, 60 * (attempt + 1))
-                print(f"artifact upload failed ({e!r}) — "
-                      f"retry {attempt + 1}/5 in {wait}s")
-                time.sleep(wait)
-
-    run.finish()
+                print(f"push {p} failed ({e!r}) — attempt {attempt}/3",
+                      flush=True)
+                time.sleep(20 * attempt)
+        else:
+            failed += 1
+    if failed or pushed == 0:
+        sys.exit(f"upload incomplete: {failed} failed, {pushed} pushed")
+    print(f"DRIVE_UPLOAD_OK {pushed} file(s) -> {folder}", flush=True)
 
 
 if __name__ == "__main__":

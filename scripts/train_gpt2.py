@@ -283,14 +283,23 @@ def main():
                    ckpt_path)
 
     def upload_ckpt(alias):
-        import wandb
-        # type must match vast/upload_results.py, which appends the final
-        # version to the SAME artifact name — wandb forbids reusing a name
-        # with a different type (found by the 2026-07-28 cloud smoke).
-        art = wandb.Artifact(
-            f"{wandb.run.project}-{wandb.run.id}", type="model")
-        art.add_file(ckpt_path)
-        wandb.log_artifact(art, aliases=[alias])
+        """Checkpoint insurance to the DRIVE BANK (wandb Artifacts dropped
+        2026-07-28: no storage on that account). Async so a 1.5 GB network
+        push never stalls the train loop; if latest.pt is overwritten by the
+        next save mid-push, bank.push's size verification fails loudly and
+        the next insurance cycle retries. `alias` kept for call-site compat.
+        """
+        import threading
+        from bank import push
+
+        def _push():
+            try:
+                push(ckpt_path, folder=f"multicore2-runs/{args.run_name}")
+            except Exception as e:
+                print(f"[train] insurance push failed ({e!r}) — "
+                      f"next cycle retries", flush=True)
+
+        threading.Thread(target=_push, daemon=True).start()
 
     if master:
         os.makedirs(run_dir, exist_ok=True)
@@ -362,7 +371,7 @@ def main():
                            **gate_stats}, step=done)
             t_last = time.time()          # don't bill eval time to the iter
 
-        if (use_wandb and args.artifact_every
+        if (master and args.artifact_every
                 and done % args.artifact_every == 0 and done < iters):
             upload_ckpt("latest")
             t_last = time.time()
@@ -372,8 +381,9 @@ def main():
               f"{iters * tokens_per_step / 1e9:.3f}B tokens, "
               f"{iters * tokens_per_step * fpt:.3e} FLOPs, "
               f"best val {best_val:.4f}", flush=True)
+        # final checkpoint push is vast/upload_results.py's job (verified,
+        # gates the instance's self-destroy) — no duplicate push here
         if use_wandb:
-            upload_ckpt("final")
             import wandb
             wandb.finish()
     if ddp:
