@@ -21,7 +21,7 @@ per-token cost differs from the baseline's MUST override this estimate to
 stay honestly matched.
 """
 import math
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 
 import torch
 import torch.nn as nn
@@ -55,14 +55,47 @@ class GPTConfig:
     # "learned" = GPT-2 wpe (capped at block_size); "rope" = rotary, no
     # position parameters — the phase-2 long-context default.
     pos: str = "learned"
+    # Hourglass (slice-carry bottleneck), hg_frac > 0 enables. The residual
+    # stream stays n_embd wide everywhere; layer l reads/writes only the
+    # FIRST layer_widths()[l] dims (trailing dims carry forward untouched —
+    # no learned transition projections). Widths fall by a constant
+    # per-layer ratio from n_embd (layer 1) to hg_frac*n_embd at layer
+    # hg_bneck, hold there for hg_mid extra flat layers, then rise by a
+    # constant ratio back to n_embd at layer n_layer. Total depth is
+    # n_layer + hg_mid. d_base (n_embd) comes from
+    # scripts/hourglass_match.py, which parameter-matches the dense arm.
+    hg_frac: float = 0.0
+    hg_bneck: int = 8
+    hg_mid: int = 0
+
+    def n_layer_total(self):
+        return self.n_layer + (self.hg_mid if self.hg_frac else 0)
+
+    def layer_widths(self, rnd=24):
+        """Per-layer residual read/write width. Rounded to `rnd` (24 keeps
+        12 heads with an even head_dim, which rope requires)."""
+        if not self.hg_frac:
+            return [self.n_embd] * self.n_layer
+        ws = []
+        for layer in range(1, self.n_layer + 1):
+            if layer <= self.hg_bneck:
+                t = (layer - 1) / (self.hg_bneck - 1)
+            else:
+                t = (self.n_layer - layer) / (self.n_layer - self.hg_bneck)
+            w = self.n_embd * self.hg_frac ** t
+            ws.append(max(rnd, rnd * round(w / rnd)))
+        return (ws[:self.hg_bneck]
+                + [ws[self.hg_bneck - 1]] * self.hg_mid
+                + ws[self.hg_bneck:])
 
     def layer_attns(self):
         """Per-layer ATTENTIONS keys, resolving attn_pattern."""
         if not self.attn_pattern:
-            return [self.attn] * self.n_layer
-        assert len(self.attn_pattern) == self.n_layer, (
+            return [self.attn] * self.n_layer_total()
+        assert len(self.attn_pattern) == self.n_layer_total(), (
             f"attn_pattern {self.attn_pattern!r} has "
-            f"{len(self.attn_pattern)} chars for {self.n_layer} layers")
+            f"{len(self.attn_pattern)} chars for "
+            f"{self.n_layer_total()} layers")
         key = {"F": self.attn, "S": "swa", "G": "gated"}
         return [key[c] for c in self.attn_pattern]
 
@@ -125,6 +158,28 @@ class Block(nn.Module):
         return x
 
 
+class SliceBlock(nn.Module):
+    """Hourglass seam: a standard block built at `width`, reading and
+    writing only the first `width` dims of the full-width residual
+    stream. Trailing dims pass through untouched (slice-and-carry — the
+    skip connection is the transition, no learned projections)."""
+
+    def __init__(self, cfg, attn_key, width):
+        super().__init__()
+        assert width % cfg.n_head == 0, (width, cfg.n_head)
+        self.width = width
+        self.block = BLOCKS[cfg.block](replace(cfg, n_embd=width),
+                                       attn_key=attn_key)
+
+    @property
+    def attn(self):
+        return self.block.attn
+
+    def forward(self, x):
+        return torch.cat((self.block(x[..., :self.width]),
+                          x[..., self.width:]), dim=-1)
+
+
 from core.gated_swa import SlidingWindowAttention, GatedSWAttention  # noqa: E402
 
 # The seams. The new architecture adds entries here; the config selects them.
@@ -143,8 +198,10 @@ class GPT(nn.Module):
         modules = dict(
             wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
-            h=nn.ModuleList(BLOCKS[cfg.block](cfg, attn_key=key)
-                            for key in cfg.layer_attns()),
+            h=nn.ModuleList(
+                BLOCKS[cfg.block](cfg, attn_key=key) if w == cfg.n_embd
+                else SliceBlock(cfg, key, w)
+                for key, w in zip(cfg.layer_attns(), cfg.layer_widths())),
             ln_f=nn.LayerNorm(cfg.n_embd, bias=cfg.bias),
         )
         if cfg.pos == "learned":
@@ -159,7 +216,7 @@ class GPT(nn.Module):
         for name, p in self.named_parameters():
             if name.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0,
-                                std=0.02 / math.sqrt(2 * cfg.n_layer))
+                                std=0.02 / math.sqrt(2 * cfg.n_layer_total()))
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -219,9 +276,10 @@ class GPT(nn.Module):
         # mean over t in [1..T] of min(t, W), the visible keys of a
         # windowed layer at training shape T
         win_keys = T if T <= W else (W * (W + 1) / 2 + (T - W) * W) / T
-        score = sum(12 * self.cfg.n_embd * (T if k == self.cfg.attn
-                                            else win_keys)
-                    for k in self.cfg.layer_attns())
+        # hourglass layers score at their own (narrower) width
+        score = sum(12 * w * (T if k == self.cfg.attn else win_keys)
+                    for k, w in zip(self.cfg.layer_attns(),
+                                    self.cfg.layer_widths()))
         return 6 * self.num_params() + score
 
     def configure_optimizers(self, weight_decay, lr, betas, device_type):

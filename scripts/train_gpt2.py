@@ -66,6 +66,19 @@ def parse_args():
     ap.add_argument("--pos", default="learned", choices=("learned", "rope"),
                     help="rope has no position params and is the "
                          "long-context default")
+    # hourglass (slice-carry bottleneck; see core/model.py SliceBlock and
+    # scripts/hourglass_match.py for the d_base that parameter-matches dense)
+    ap.add_argument("--hg-frac", type=float, default=0.0,
+                    help="waist width as a fraction of d_base; 0 disables")
+    ap.add_argument("--hg-bneck", type=int, default=8,
+                    help="which layer is narrowest")
+    ap.add_argument("--hg-mid", type=int, default=0,
+                    help="extra flat layers at the waist (total depth = "
+                         "n_layer + this)")
+    ap.add_argument("--hg-dbase", type=int, default=0,
+                    help="residual stream width, from hourglass_match.py; "
+                         "overrides the scale's n_embd. Required with "
+                         "--hg-frac")
     ap.add_argument("--lb-coef", type=float, default=0.01,
                     help="router load-balance aux weight (G layers only; "
                          "the router measurably collapses at init without "
@@ -122,8 +135,15 @@ def parse_args():
         args.eval_iters = 5
         args.artifact_every = 0
         args.no_compile = True
+    if args.hg_frac:
+        assert args.hg_dbase, "--hg-dbase required with --hg-frac"
     if args.run_name is None:
-        if args.attn_pattern:
+        if args.hg_frac:
+            args.run_name = (f"{args.scale}-hg-f{args.hg_frac}"
+                             f"-b{args.hg_bneck}"
+                             + (f"-m{args.hg_mid}" if args.hg_mid else "")
+                             + f"-d{args.hg_dbase}")
+        elif args.attn_pattern:
             args.run_name = (f"{args.scale}-{args.attn_pattern}-w{args.window}"
                              + (f"-g{args.n_gates}"
                                 if "G" in args.attn_pattern else "")
@@ -164,12 +184,16 @@ def main():
     # ------------------------------------------------------------ model
     scale = dict(SCALES[args.scale])
     block_size = max(scale.pop("block_size", 1024), args.seq_len)
+    if args.hg_frac:
+        scale["n_embd"] = args.hg_dbase
     cfg = GPTConfig(block_size=block_size, vocab_size=VOCAB_SIZE,
                     dropout=args.dropout, block=args.block, attn=args.attn,
                     mlp=args.mlp, attn_pattern=args.attn_pattern,
                     window=args.window, n_gates=args.n_gates,
                     recent_band=args.recent_band, pos=args.pos,
                     lb_coef=args.lb_coef if "G" in args.attn_pattern else 0.0,
+                    hg_frac=args.hg_frac, hg_bneck=args.hg_bneck,
+                    hg_mid=args.hg_mid,
                     **scale)
     model = GPT(cfg).to(device)
     n_params = model.num_params()
