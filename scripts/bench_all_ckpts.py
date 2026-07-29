@@ -3,12 +3,13 @@
     python scripts/bench_all_ckpts.py [--batch-size 128] [--force]
 
 For each run folder under gdrive:multicore2-runs/ that has a best.pt:
-pull the checkpoint, run scripts/lm_eval_bench.py on it, push the
-resulting lm_eval.json back next to the checkpoint. IDEMPOTENT: run
-folders that already show an lm_eval.json on Drive are skipped (--force
-overrides), so re-invoking after later training arms finish benches only
-the new arrivals. Installs lm-eval on demand (not in requirements.txt —
-training instances don't need it).
+pull the checkpoint, run scripts/lm_eval_bench.py and
+scripts/needle_probe.py on it, push the resulting lm_eval.json /
+needle_probe.json back next to the checkpoint. IDEMPOTENT per artifact:
+whichever result files a run folder already shows on Drive are skipped
+(--force overrides), so re-invoking benches only what is missing.
+Installs lm-eval on demand (not in requirements.txt — training instances
+don't need it).
 
 Designed to be a vast.ai --train-script: ignores unknown args (--wandb).
 """
@@ -50,6 +51,12 @@ def main():
     runs = [d["Name"] for d in lsjson(remote) if d.get("IsDir")]
     print(f"[bench_all] {len(runs)} run(s) on the bank: {runs}", flush=True)
 
+    # result file -> the command that produces it (run from repo root)
+    jobs = {
+        "lm_eval.json": [sys.executable, "scripts/lm_eval_bench.py",
+                         "--batch-size", str(args.batch_size)],
+        "needle_probe.json": [sys.executable, "scripts/needle_probe.py"],
+    }
     done, skipped, failed = [], [], []
     for name in runs:
         files = {f["Name"]: f["Size"] for f in lsjson(f"{remote}/{name}")}
@@ -57,7 +64,8 @@ def main():
             print(f"[bench_all] {name}: no best.pt, skipping", flush=True)
             skipped.append(name)
             continue
-        if "lm_eval.json" in files and not args.force:
+        todo = [a for a in jobs if a not in files or args.force]
+        if not todo:
             print(f"[bench_all] {name}: already benchmarked, skipping",
                   flush=True)
             skipped.append(name)
@@ -71,18 +79,20 @@ def main():
                 print(f"[bench_all] {name}: pull failed", flush=True)
                 failed.append(name)
                 continue
-        proc = subprocess.run(
-            [sys.executable, "scripts/lm_eval_bench.py", "--run-name", name,
-             "--batch-size", str(args.batch_size)], timeout=7200)
-        if proc.returncode != 0:
-            print(f"[bench_all] {name}: eval FAILED rc={proc.returncode}",
-                  flush=True)
-            failed.append(name)
-            continue
-        bank.push(os.path.join("runs", name, "lm_eval.json"),
-                  folder=f"{RUNS_FOLDER}/{name}")
-        done.append(name)
-        print(f"BENCHED {name}", flush=True)
+        ok = True
+        for artifact in todo:
+            proc = subprocess.run(jobs[artifact] + ["--run-name", name],
+                                  timeout=7200)
+            if proc.returncode != 0:
+                print(f"[bench_all] {name}: {artifact} FAILED "
+                      f"rc={proc.returncode}", flush=True)
+                ok = False
+                continue
+            bank.push(os.path.join("runs", name, artifact),
+                      folder=f"{RUNS_FOLDER}/{name}")
+        (done if ok else failed).append(name)
+        if ok:
+            print(f"BENCHED {name}", flush=True)
 
     print(f"BENCH_ALL_DONE done={done} skipped={skipped} failed={failed}",
           flush=True)
