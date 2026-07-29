@@ -314,9 +314,16 @@ def build_onstart(branch: str, train_args: str, bench_only: bool,
     # Run our provisioning in the background and hand the foreground to the
     # template's own entrypoint.sh (portal/jupyter/workspace setup) â€” do NOT
     # replace it. Our output still reaches `vastai logs` via /proc/1/fd/1.
+    # Clone with retries: vast DC <-> GitHub TLS is flaky (2026-07-29: three
+    # boxes in a row died at a one-shot clone — GnuTLS resets / timeouts that
+    # succeed on manual retry). A box whose boot chain fails also tends to be
+    # reaped by vast ~20-40 min later, so the clone failing is fatal twice.
+    clone = (f"n=0; until git clone -b {branch} {REPO_URL}; do "
+             f"n=$((n+1)); [ $n -ge 10 ] && exit 1; "
+             f"echo CLONE_RETRY $n; sleep 30; done")
     provision = (
         f"cd /workspace && rm -rf {REPO_DIR} && "
-        f"git clone -b {branch} {REPO_URL} && "
+        f"{clone} && "
         f"cd {REPO_DIR} && "
         + " && ".join(exports) + " && "
         "bash vast/onstart.sh"

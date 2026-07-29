@@ -1,7 +1,8 @@
 {
-  "_comment": "Boot gate for GPT-2 training hosts (4090/5090 class). Unlike SmallCore this workload IS FLOP-bound, so bf16 throughput gets a real floor again (a healthy 4090 measures ~150+, a 5090 ~236; 80 rejects broken or misdescribed cards without rejecting an A100). drive_pull_mbps guards the 7.5 GB token-cache pull from the Drive bank. CAUTION: the gate measures a SINGLE stream, but the real pull uses 8 streams and runs 3-5x faster (measured repeatedly 2026-07-28/29). During Drive congestion a healthy Taiwan host measured 85.8 and the 100-threshold self-destroyed a good box (and silently killed another with no keep-alive); 60 single-stream ~= 200+ real, capping the pull at ~5 min. disk floor: the cache + checkpoints are written to /workspace, and a 10 MB/s disk burned a run on 2026-07-26. Re-derive with `launch.py scan` when changing GPU class.",
+  "_comment": "Boot gate for GPT-2 training hosts (4090/5090 class). Unlike SmallCore this workload IS FLOP-bound, so bf16 throughput gets a real floor again (a healthy 4090 measures ~150+, a 5090 ~236; 80 rejects broken or misdescribed cards without rejecting an A100). disk floor: the cache + checkpoints are written to /workspace, and a 10 MB/s disk burned a run on 2026-07-26. Re-derive with `launch.py scan` when changing GPU class.",
+  "_comment_drive_pull": "Guards the 7.5 GB token-cache pull. The test measures a SINGLE stream; the real pull uses 8 and runs 3-5x faster. History: 100 killed healthy boxes during congestion -> 60 (2026-07-29 morning). By that afternoon Drive was congested enough that 60 rejected four otherwise-pristine hosts (one at 48.0 with 226 TFLOPS and a healthy disk) at ~$0.60/rejection. A slow pull only costs BOOT time, never run correctness: 25 single-stream still finishes 7.5 GB inside the 15-min boot budget even if multi-stream gives no speedup, while still catching genuine egress failures (this project has seen None, 8.4, and 12.3 on hosts that could not reach GitHub either).",
   "gpu_bf16_tflops": 80,
   "pcie_h2d_gbps": 4,
   "disk_write_mbps": 200,
-  "drive_pull_mbps": 60
+  "drive_pull_mbps": 25
 }
