@@ -56,6 +56,7 @@ def main():
         "lm_eval.json": [sys.executable, "scripts/lm_eval_bench.py",
                          "--batch-size", str(args.batch_size)],
         "needle_probe.json": [sys.executable, "scripts/needle_probe.py"],
+        "stream_probe.json": [sys.executable, "scripts/stream_probe.py"],
     }
     done, skipped, failed = [], [], []
     for name in runs:
