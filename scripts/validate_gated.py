@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--micro-bs", type=int, default=8)
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--pattern", default="FGGGGFFGGGGF")
+    ap.add_argument("--pos", default="learned", choices=("learned", "rope"))
     ap.add_argument("--no-flex", action="store_true")
     ap.add_argument("--compile-only", action="store_true",
                     help="skip density stats; just the compile check")
@@ -38,7 +39,11 @@ def main():
     torch.manual_seed(1234)
 
     B, T = args.micro_bs, args.seq_len
-    cfg = GPTConfig(attn_pattern=args.pattern, window=512, n_gates=8)
+    # COW layers need the band+chains budget split; G/S layers ignore it
+    band = 256 if "C" in args.pattern else 0
+    cfg = GPTConfig(attn_pattern=args.pattern, window=512, n_gates=8,
+                    recent_band=band, pos=args.pos,
+                    block_size=max(1024, args.seq_len))
     model = GPT(cfg).to(device).eval()
     idx = torch.randint(0, cfg.vocab_size, (B, T), device=device)
 

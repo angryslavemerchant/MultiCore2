@@ -54,9 +54,10 @@ def parse_args():
     ap.add_argument("--mlp", default="gelu")
     ap.add_argument("--attn-pattern", default="",
                     help="per-layer attention, one char per layer: F=full, "
-                         "S=sliding window, G=admission-gated. The 2:1 "
-                         "sandwich is FGGGGFFGGGGF (gated) / FSSSSFFSSSSF "
-                         "(SWA control). Empty = all layers --attn")
+                         "S=sliding window, G=admission-gated, C=COW "
+                         "archive. The 2:1 sandwich is FGGGGFFGGGGF (gated) "
+                         "/ FSSSSFFSSSSF (SWA control) / FCCCCFFCCCCF "
+                         "(COW). Empty = all layers --attn")
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--n-gates", type=int, default=8)
     ap.add_argument("--recent-band", type=int, default=0,
@@ -80,9 +81,18 @@ def parse_args():
                          "overrides the scale's n_embd. Required with "
                          "--hg-frac")
     ap.add_argument("--lb-coef", type=float, default=0.01,
-                    help="router load-balance aux weight (G layers only; "
+                    help="router load-balance aux weight (G/C layers; "
                          "the router measurably collapses at init without "
                          "it). 0 disables")
+    # COW archive (C layers): recent_band raw + n_gates*cow_chains versions
+    ap.add_argument("--cow-chains", type=int, default=32,
+                    help="C layers: K live chains per gate; budget assert "
+                         "n_gates*K == window - recent_band")
+    ap.add_argument("--cow-theta", type=float, default=0.7,
+                    help="C layers: vigilance; best cosine >= theta merges "
+                         "into the chain, below births a new one")
+    ap.add_argument("--cow-chunk", type=int, default=128,
+                    help="C layers: chain-scan chunk (heads frozen within)")
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--dropout", type=float, default=0.0)
     # stopping rule (first non-None wins, in this order)
@@ -147,6 +157,9 @@ def parse_args():
             args.run_name = (f"{args.scale}-{args.attn_pattern}-w{args.window}"
                              + (f"-g{args.n_gates}"
                                 if "G" in args.attn_pattern else "")
+                             + (f"-g{args.n_gates}k{args.cow_chains}"
+                                f"-th{args.cow_theta}"
+                                if "C" in args.attn_pattern else "")
                              + (f"-r{args.recent_band}"
                                 if args.recent_band else ""))
         else:
@@ -191,9 +204,12 @@ def main():
                     mlp=args.mlp, attn_pattern=args.attn_pattern,
                     window=args.window, n_gates=args.n_gates,
                     recent_band=args.recent_band, pos=args.pos,
-                    lb_coef=args.lb_coef if "G" in args.attn_pattern else 0.0,
+                    lb_coef=(args.lb_coef
+                             if ("G" in args.attn_pattern
+                                 or "C" in args.attn_pattern) else 0.0),
                     hg_frac=args.hg_frac, hg_bneck=args.hg_bneck,
-                    hg_mid=args.hg_mid,
+                    hg_mid=args.hg_mid, cow_chains=args.cow_chains,
+                    cow_theta=args.cow_theta, cow_chunk=args.cow_chunk,
                     **scale)
     model = GPT(cfg).to(device)
     n_params = model.num_params()

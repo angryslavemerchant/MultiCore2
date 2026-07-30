@@ -67,6 +67,11 @@ class GPTConfig:
     hg_frac: float = 0.0
     hg_bneck: int = 8
     hg_mid: int = 0
+    # COW archive (attn="cow" / pattern letter C): recent_band raw keys +
+    # n_gates*cow_chains live chain versions == window total budget.
+    cow_chains: int = 32       # K live chains per gate
+    cow_theta: float = 0.7     # vigilance: best cosine >= theta -> merge
+    cow_chunk: int = 128       # chain-scan chunk (heads frozen within)
 
     def n_layer_total(self):
         return self.n_layer + (self.hg_mid if self.hg_frac else 0)
@@ -96,7 +101,7 @@ class GPTConfig:
             f"attn_pattern {self.attn_pattern!r} has "
             f"{len(self.attn_pattern)} chars for "
             f"{self.n_layer_total()} layers")
-        key = {"F": self.attn, "S": "swa", "G": "gated"}
+        key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow"}
         return [key[c] for c in self.attn_pattern]
 
 
@@ -181,11 +186,13 @@ class SliceBlock(nn.Module):
 
 
 from core.gated_swa import SlidingWindowAttention, GatedSWAttention  # noqa: E402
+from core.cow import COWAttention  # noqa: E402
 
 # The seams. The new architecture adds entries here; the config selects them.
 ATTENTIONS = {"causal": CausalSelfAttention,
               "swa": SlidingWindowAttention,
-              "gated": GatedSWAttention}
+              "gated": GatedSWAttention,
+              "cow": COWAttention}
 MLPS = {"gelu": GeluMLP}
 BLOCKS = {"gpt2": Block}
 
@@ -273,11 +280,21 @@ class GPT(nn.Module):
         ~0.005% and ignored."""
         T = T or self.cfg.block_size
         W = self.cfg.window
-        # mean over t in [1..T] of min(t, W), the visible keys of a
-        # windowed layer at training shape T
-        win_keys = T if T <= W else (W * (W + 1) / 2 + (T - W) * W) / T
+
+        def avg_keys(w):
+            # mean over t in [1..T] of min(t, w): visible keys at width w
+            return T if T <= w else (w * (w + 1) / 2 + (T - w) * w) / T
+
+        win_keys = avg_keys(W)
+        # cow layers: raw band + at most n_gates*cow_chains live versions.
+        # Upper bound (band + G*K == window by the budget assert), counted
+        # as two populations because both saturate independently.
+        cow_keys = (avg_keys(self.cfg.recent_band)
+                    + avg_keys(self.cfg.n_gates * self.cfg.cow_chains))
+        keys_for = {"cow": cow_keys}
         # hourglass layers score at their own (narrower) width
-        score = sum(12 * w * (T if k == self.cfg.attn else win_keys)
+        score = sum(12 * w * (T if k == self.cfg.attn
+                              else keys_for.get(k, win_keys))
                     for k, w in zip(self.cfg.layer_attns(),
                                     self.cfg.layer_widths()))
         return 6 * self.num_params() + score
