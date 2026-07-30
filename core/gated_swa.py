@@ -48,23 +48,26 @@ from core.diffattn import DiffMixin, rms
 
 USE_FLEX = True     # module-level override for tests / debugging
 
-# Flex kernel block sizes. The autotuner's default configs blow the
-# 5090's 101KB shared-memory limit when value head_dim is 2*hd (diff
-# attention at the franken's widest layers, v=208): "No valid triton
-# configs", measured 2026-07-30. Defaults below are the VALIDATED config
-# (compiled-vs-eager max|diff| 8.8e-06 on 8x5090, after clearing a stale
-# inductor cache that replayed the failing autotune): M=64 N=32 stages=2.
-# FLEX_BLOCK_M / FLEX_BLOCK_N / FLEX_NUM_STAGES env vars override;
-# FLEX_BLOCK_M=-1 restores the autotuner's own choices.
+# Flex kernel block sizes, OPT-IN via FLEX_BLOCK_M / FLEX_BLOCK_N /
+# FLEX_NUM_STAGES env vars — needed ONLY for diff attention, whose 2*hd
+# value heads (v=208 at the franken's widest layers) blow the 5090's
+# 101KB shared memory under every autotuner config ("No valid triton
+# configs"). M=64 N=32 stages=2 validated compiled-vs-eager 8.8e-06.
+# DO NOT default these on: the integer kernel_options dict crashes
+# DDPOptimizer's graph splitting ("'int' object has no attribute
+# 'meta'", bisected 2026-07-30 — single-GPU+options OK, DDP+no-options
+# OK, DDP+options dies), so runs that use them must also set
+# torch._dynamo.config.optimize_ddp=False (train_gpt2 does this when
+# --diff-attn is on).
 _FLEX_OPTS = None
 
 
 def _flex_opts():
     global _FLEX_OPTS
     if _FLEX_OPTS is None:
-        bm = int(os.environ.get("FLEX_BLOCK_M", "64"))
-        bn = int(os.environ.get("FLEX_BLOCK_N", "32"))
-        ns = int(os.environ.get("FLEX_NUM_STAGES", "2"))
+        bm = int(os.environ.get("FLEX_BLOCK_M", "0"))
+        bn = int(os.environ.get("FLEX_BLOCK_N", "0"))
+        ns = int(os.environ.get("FLEX_NUM_STAGES", "0"))
         opts = {}
         if bm > 0 and bn > 0:
             opts = {"BLOCK_M": bm, "BLOCK_N": bn,

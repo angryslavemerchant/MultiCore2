@@ -287,6 +287,13 @@ def main():
 
     compile_ok = (device_type == "cuda" and not args.no_compile
                   and platform.system() != "Windows")
+    if args.diff_attn:
+        # diff's 2*hd value heads need explicit flex tiles on consumer
+        # GPUs (see core/gated_swa._flex_opts) — opt in here so plain
+        # runs keep the autotuner (and DDPOptimizer) untouched
+        os.environ.setdefault("FLEX_BLOCK_M", "64")
+        os.environ.setdefault("FLEX_BLOCK_N", "32")
+        os.environ.setdefault("FLEX_NUM_STAGES", "2")
     if compile_ok:
         if args.diff_attn and ddp:
             # DDPOptimizer's graph-splitting chokes on flex_attention's
