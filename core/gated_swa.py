@@ -38,6 +38,8 @@ BlockMask (CUDA + torch>=2.5) which actually SKIPS dead blocks — that path
 is what realizes the windowed layers' compute savings on rented GPUs.
 Selection is automatic; core.gated_swa.USE_FLEX = False forces it off.
 """
+import os
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -45,6 +47,28 @@ from torch.nn import functional as F
 from core.diffattn import DiffMixin, rms
 
 USE_FLEX = True     # module-level override for tests / debugging
+
+# Flex kernel block-size override (FLEX_BLOCK_M / FLEX_BLOCK_N env vars).
+# Needed for diff attention on consumer GPUs: value head_dim 2*hd at the
+# franken's widest layers (208) blows the 5090's 101KB shared-memory limit
+# under the autotuner's default configs ("No valid triton configs",
+# measured 2026-07-30). Smaller blocks trade a little occupancy for
+# fitting; backward-pass blocks are set proportionally.
+_FLEX_OPTS = None
+
+
+def _flex_opts():
+    global _FLEX_OPTS
+    if _FLEX_OPTS is None:
+        bm = int(os.environ.get("FLEX_BLOCK_M", "0"))
+        bn = int(os.environ.get("FLEX_BLOCK_N", "0"))
+        opts = {}
+        if bm and bn:
+            opts = {"BLOCK_M": bm, "BLOCK_N": bn,
+                    "BLOCK_M1": bm // 2, "BLOCK_N1": bn,
+                    "BLOCK_M2": bm, "BLOCK_N2": bn // 2}
+        _FLEX_OPTS = opts
+    return _FLEX_OPTS or None
 
 try:
     from torch.nn.attention.flex_attention import (
@@ -136,7 +160,7 @@ def _prepare_attend(death, B, T, device, cache_key=None):
         else:
             block_mask = _build_block_mask(death, B, T, device)
         return lambda q, k, v, dropout_p=0.0: flex_attention(
-            q, k, v, block_mask=block_mask)
+            q, k, v, block_mask=block_mask, kernel_options=_flex_opts())
     mask = interval_mask(death, T)
     return lambda q, k, v, dropout_p=0.0: F.scaled_dot_product_attention(
         q, k, v, attn_mask=mask, dropout_p=dropout_p)
