@@ -288,6 +288,13 @@ def main():
     compile_ok = (device_type == "cuda" and not args.no_compile
                   and platform.system() != "Windows")
     if compile_ok:
+        if args.diff_attn and ddp:
+            # DDPOptimizer's graph-splitting chokes on flex_attention's
+            # higher-order op when diff attention is on ("'int' object has
+            # no attribute 'meta'", bisected 2026-07-30: single-process
+            # trains, any DDP rank count crashes). Compile the whole graph
+            # instead; DDP still overlaps at graph boundaries.
+            torch._dynamo.config.optimize_ddp = False
         model = torch.compile(model)
     raw_model = model._orig_mod if compile_ok else model
 
