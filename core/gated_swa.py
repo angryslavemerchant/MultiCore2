@@ -48,19 +48,15 @@ from core.diffattn import DiffMixin, rms
 
 USE_FLEX = True     # module-level override for tests / debugging
 
-# flash kernels for plain SWA layers: native banded iteration via
-# window_size, immune to flex's 128-tile granularity that bills a w=32
-# window like w~200 (measured on the pyramid, 2026-07-30). Two sources,
-# tried in order on first CUDA forward (lazy — no network/import cost on
-# CPU or when unused):
-#   1. flash_attn (FA2, ours from source: gdrive:multicore2/wheels/)
-#   2. an HF kernels-hub build (FLASH_HUB_KERNEL env, default the
-#      community FA4 sm120 build) — probed once with a real windowed
-#      call: no window_size support or unsupported head dims -> rejected.
+# Banded flash kernels for plain SWA layers: native window iteration,
+# immune to flex's 128-tile granularity that bills a w=32 window like
+# w~200 (measured on the pyramid, 2026-07-30). Resolved lazily on first
+# CUDA forward (no import cost on CPU or when unused): flash_attn (FA2)
+# if installed, else xformers (official wheels track torch releases —
+# verified sm120/torch2.12, 1.59x over flex on the pyramid). Each
+# candidate is probed with a real windowed call before being trusted.
 # Kill switch: FLASH_SWA=0 env or core.gated_swa.USE_FLASH = False.
 USE_FLASH = os.environ.get("FLASH_SWA", "1") != "0"
-FLASH_HUB_KERNEL = os.environ.get(
-    "FLASH_HUB_KERNEL", "SecondNatureComputing/flash-attn-4-sm120")
 _FLASH_FN = None        # resolved callable, False = resolution failed
 _HAVE_FLASH = None      # tri-state mirror for tests: None=unresolved
 
@@ -97,18 +93,7 @@ def _resolve_flash():
             return memory_efficient_attention(q, k, v, attn_bias=mask)
         return fn
 
-    def _hub():
-        from kernels import get_kernel
-        hub = get_kernel(FLASH_HUB_KERNEL, trust_remote_code=True,
-                         revision="main")
-
-        def fn(q, k, v, causal, window_size):
-            out = hub.flash_attn_func(q, k, v, causal=causal,
-                                      window_size=window_size)
-            return out[0] if isinstance(out, tuple) else out
-        return fn
-
-    for candidate in (_fa2, _xformers, _hub):
+    for candidate in (_fa2, _xformers):
         try:
             _FLASH_FN = _probe(candidate())
             break
