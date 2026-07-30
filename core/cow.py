@@ -204,6 +204,23 @@ def _scan_chunk(kc, gc, pos_c, c1_t, head_key, head_pos, birth_id,
 
 COMPILE_SCAN = True          # module-level override for tests / debugging
 _scan_chunk_compiled = None
+_flex_compiled = None
+
+
+def _get_flex_fn():
+    """flex_attention, compiled when called from an uncompiled (eval) context.
+
+    Uncompiled flex falls back to a math kernel that materializes the full
+    B*H*T*2T fp32 score matrix — with COW's doubled KV that is 12+ GiB and
+    OOMs every probe script. Inside torch.compile, return the raw op so
+    inductor fuses it as part of the surrounding graph.
+    """
+    global _flex_compiled
+    if torch.compiler.is_compiling():
+        return flex_attention
+    if _flex_compiled is None:
+        _flex_compiled = torch.compile(flex_attention)
+    return _flex_compiled
 
 
 def _get_scan_step(is_cuda):
@@ -211,8 +228,10 @@ def _get_scan_step(is_cuda):
     if not (COMPILE_SCAN and is_cuda):
         return _scan_chunk
     if _scan_chunk_compiled is None:
-        _scan_chunk_compiled = torch.compile(_scan_chunk, fullgraph=True,
-                                             dynamic=False)
+        # dynamic=None (not False): training shapes are static so the first
+        # compile is identical, but eval scripts feed varying batch sizes and
+        # dynamic=False hard-fails on the recompile limit under fullgraph.
+        _scan_chunk_compiled = torch.compile(_scan_chunk, fullgraph=True)
     return _scan_chunk_compiled
 
 
@@ -455,7 +474,7 @@ class COWAttention(SlidingWindowAttention):
         if _gsw.USE_FLEX and _HAVE_FLEX and q.is_cuda:
             bm = _build_cow_block_mask(death, self.recent_band, B, T,
                                        q.device)
-            return flex_attention(q, k2, v2, block_mask=bm)
+            return _get_flex_fn()(q, k2, v2, block_mask=bm)
         mask = cow_interval_mask(death, self.recent_band, T)
         return F.scaled_dot_product_attention(
             q, k2, v2, attn_mask=mask,
