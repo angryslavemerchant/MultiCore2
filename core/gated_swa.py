@@ -48,28 +48,30 @@ from core.diffattn import DiffMixin, rms
 
 USE_FLEX = True     # module-level override for tests / debugging
 
-# Flex kernel block-size override (FLEX_BLOCK_M / FLEX_BLOCK_N env vars).
-# Needed for diff attention on consumer GPUs: value head_dim 2*hd at the
-# franken's widest layers (208) blows the 5090's 101KB shared-memory limit
-# under the autotuner's default configs ("No valid triton configs",
-# measured 2026-07-30). Smaller blocks trade a little occupancy for
-# fitting; backward-pass blocks are set proportionally.
+# Flex kernel block sizes. The autotuner's default configs blow the
+# 5090's 101KB shared-memory limit when value head_dim is 2*hd (diff
+# attention at the franken's widest layers, v=208): "No valid triton
+# configs", measured 2026-07-30. Defaults below are the VALIDATED config
+# (compiled-vs-eager max|diff| 8.8e-06 on 8x5090, after clearing a stale
+# inductor cache that replayed the failing autotune): M=64 N=32 stages=2.
+# FLEX_BLOCK_M / FLEX_BLOCK_N / FLEX_NUM_STAGES env vars override;
+# FLEX_BLOCK_M=-1 restores the autotuner's own choices.
 _FLEX_OPTS = None
 
 
 def _flex_opts():
     global _FLEX_OPTS
     if _FLEX_OPTS is None:
-        bm = int(os.environ.get("FLEX_BLOCK_M", "0"))
-        bn = int(os.environ.get("FLEX_BLOCK_N", "0"))
-        ns = int(os.environ.get("FLEX_NUM_STAGES", "0"))
+        bm = int(os.environ.get("FLEX_BLOCK_M", "64"))
+        bn = int(os.environ.get("FLEX_BLOCK_N", "32"))
+        ns = int(os.environ.get("FLEX_NUM_STAGES", "2"))
         opts = {}
-        if bm and bn:
+        if bm > 0 and bn > 0:
             opts = {"BLOCK_M": bm, "BLOCK_N": bn,
                     "BLOCK_M1": bm // 2, "BLOCK_N1": bn,
                     "BLOCK_M2": bm, "BLOCK_N2": bn // 2}
-        if ns:
-            opts["num_stages"] = ns
+            if ns > 0:
+                opts["num_stages"] = ns
         _FLEX_OPTS = opts
     return _FLEX_OPTS or None
 
