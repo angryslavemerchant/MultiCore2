@@ -15,7 +15,7 @@ carry operational history worth reading before renting anything.
   gate on real bf16 throughput (`thresholds_gpt2.json`, the onstart
   default). The SmallCore rule "shop for the CPU" does NOT apply here.
 - **The dataset is a 7.5 GB token cache on the Drive bank**
-  (`gdrive:multicore-cache/fineweb100_gpt-neox-20b_5shards_u16.bin`, 3.76B
+  (`gdrive:multicore2/multicore-cache/fineweb100_gpt-neox-20b_5shards_u16.bin`, 3.76B
   GPT-NeoX tokens, built by MultiCore 2026-07-28 and shared between the two
   projects — it is immutable, do not overwrite it). Boot order:
   `core/data.py` first tries `bank.try_pull` (~90 s), falls back to

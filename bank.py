@@ -30,7 +30,10 @@ import tempfile
 import time
 
 REMOTE = "gdrive"
-REMOTE_FOLDER = "multicore-cache"
+# 2026-07-30: user consolidated Drive — the cache folder moved INSIDE
+# gdrive:multicore2/ (next to MultiCore2.bundle). Nested rclone paths are
+# fine; nothing else changed.
+REMOTE_FOLDER = "multicore2/multicore-cache"
 BANK_REMOTE = f"{REMOTE}:{REMOTE_FOLDER}"
 # What vast/benchmark.py ranged-reads to measure Drive throughput at boot.
 BANK_FILE = "fineweb100_gpt-neox-20b_5shards_u16.bin"
