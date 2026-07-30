@@ -193,6 +193,11 @@ class SlidingWindowAttention(DiffMixin, nn.Module):
         self.use_rope = cfg.pos == "rope"
         self.qk_norm = cfg.qk_norm
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        if cfg.canon_full:
+            from core.model import Canon
+            self.canon_b = Canon(3 * cfg.n_embd)
+        else:
+            self.canon_b = None
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
         self.resid_dropout = nn.Dropout(cfg.dropout)
@@ -204,7 +209,10 @@ class SlidingWindowAttention(DiffMixin, nn.Module):
 
     def _qkv(self, x):
         B, T, C = x.shape
-        q, k, v = self.c_attn(x).split(C, dim=2)
+        qkv = self.c_attn(x)
+        if self.canon_b is not None:
+            qkv = qkv + self.canon_b(qkv)
+        q, k, v = qkv.split(C, dim=2)
         shp = (B, T, self.n_head, C // self.n_head)
         q = q.view(shp).transpose(1, 2)
         k = k.view(shp).transpose(1, 2)

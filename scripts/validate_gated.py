@@ -36,6 +36,10 @@ def main():
                          "canon, rms, qk-norm, relu2, untied, zero-init, "
                          "softcap, hourglass f0.3 d1152) instead of the "
                          "plain gated one")
+    ap.add_argument("--pyramid", action="store_true",
+                    help="the pyramid-SWA hourglass: window schedule "
+                         "32..512|F waist|2048,1024,512, full canon, no "
+                         "diff attn (franken stack otherwise)")
     args = ap.parse_args()
     if args.no_flex:
         from core import gated_swa
@@ -44,7 +48,16 @@ def main():
     torch.manual_seed(1234)
 
     B, T = args.micro_bs, args.seq_len
-    if args.franken:
+    if args.pyramid:
+        cfg = GPTConfig(attn_pattern="SSSSSFFFFSSS",
+                        windows="32,64,128,256,512,F,F,F,F,2048,1024,512",
+                        window=512, pos="rope", n_embd=1152,
+                        hg_frac=0.3, hg_bneck=8, hg_round=96,
+                        mlp="relu2", norm="rms", qk_norm=True,
+                        canon=True, canon_full=True, softcap=15.0,
+                        untied=True, zero_init=True, bias=False,
+                        block_size=max(1024, args.seq_len))
+    elif args.franken:
         cfg = GPTConfig(attn_pattern=args.pattern, window=256, n_gates=4,
                         recent_band=128, pos="rope", n_embd=1152,
                         hg_frac=0.3, hg_bneck=8, hg_round=96,
@@ -59,7 +72,7 @@ def main():
                         recent_band=band, pos=args.pos,
                         block_size=max(1024, args.seq_len))
     model = GPT(cfg).to(device).eval()
-    if args.franken:
+    if args.franken or args.pyramid:
         # zero-init head/projections/canon would make the compiled-vs-eager
         # diff vacuously 0 and leave those paths unexercised — randomize
         # them for VALIDATION only (training keeps the real zero init)

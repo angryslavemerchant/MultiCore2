@@ -59,6 +59,11 @@ def parse_args():
                          "/ FSSSSFFSSSSF (SWA control) / FCCCCFFCCCCF "
                          "(COW). Empty = all layers --attn")
     ap.add_argument("--window", type=int, default=512)
+    ap.add_argument("--windows", default="",
+                    help="per-layer window schedule (pyramid), comma-"
+                         "separated, one entry per layer; F layers' entries "
+                         "ignored. E.g. 32,64,128,256,512,F,F,F,F,2048,"
+                         "1024,512. Empty = uniform --window")
     ap.add_argument("--n-gates", type=int, default=8)
     ap.add_argument("--recent-band", type=int, default=0,
                     help="G layers: guaranteed-visible recent tokens out of "
@@ -101,6 +106,9 @@ def parse_args():
     ap.add_argument("--qk-norm", action="store_true")
     ap.add_argument("--diff-attn", action="store_true")
     ap.add_argument("--canon", action="store_true")
+    ap.add_argument("--canon-full", action="store_true",
+                    help="full A/B/C/D canon: adds convs on q,k,v (B) and "
+                         "the MLP hidden (D); use WITH --canon for A/C")
     ap.add_argument("--softcap", type=float, default=0.0)
     ap.add_argument("--untied", action="store_true")
     ap.add_argument("--zero-init", action="store_true",
@@ -221,7 +229,8 @@ def main():
     cfg = GPTConfig(block_size=block_size, vocab_size=VOCAB_SIZE,
                     dropout=args.dropout, block=args.block, attn=args.attn,
                     mlp=args.mlp, attn_pattern=args.attn_pattern,
-                    window=args.window, n_gates=args.n_gates,
+                    window=args.window, windows=args.windows,
+                    n_gates=args.n_gates,
                     recent_band=args.recent_band, pos=args.pos,
                     lb_coef=(args.lb_coef
                              if ("G" in args.attn_pattern
@@ -232,6 +241,7 @@ def main():
                     cow_theta=args.cow_theta, cow_chunk=args.cow_chunk,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
+                    canon_full=args.canon_full,
                     softcap=args.softcap, untied=args.untied,
                     zero_init=args.zero_init, bias=not args.no_bias,
                     **scale)

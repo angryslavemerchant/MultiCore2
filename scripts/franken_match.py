@@ -28,10 +28,11 @@ def franken_cfg(d_base, args):
     return GPTConfig(
         block_size=args.T, n_embd=d_base, n_head=N_HEAD,
         attn_pattern=args.pattern, window=args.window,
+        windows=getattr(args, "windows", ""),
         n_gates=args.n_gates, recent_band=args.recent_band, pos="rope",
         hg_frac=args.frac, hg_bneck=args.bneck, hg_round=args.rnd,
         norm="rms", qk_norm=True, diff_attn=not getattr(args, "no_diff", False),
-        canon=True,
+        canon=True, canon_full=getattr(args, "canon_full", False),
         softcap=15.0, untied=True, zero_init=True, bias=False,
         mlp="relu2")
 
@@ -48,13 +49,15 @@ def params_and_flops(d_base, args):
     n = 2 * VOCAB * d_base + d_base          # wte + lm_head + ln_f (rms)
     n_compute = VOCAB * d_base + d_base      # wte is lookup-only (untied)
     score = 0.0
-    for ch, w in zip(cfg.attn_pattern, ws):
+    for ch, w, win in zip(cfg.attn_pattern, ws, cfg.layer_windows()):
         layer = 12 * w * w + 2 * w + 8 * w + 4 * (w // N_HEAD)
         if ch == "G":
             layer += cfg.n_gates * w
+        if cfg.canon_full:
+            layer += 28 * w      # canon B (k*3w=12w) + canon D (k*4w=16w)
         n += layer
         n_compute += layer
-        score += 12 * w * (T if ch == "F" else avg_keys(cfg.window))
+        score += 12 * w * (T if win is None else avg_keys(win))
     diff = 1.0 if getattr(args, "no_diff", False) else 1.5
     return n, 6 * n_compute + diff * score
 
@@ -71,6 +74,9 @@ def main():
     ap.add_argument("--T", type=int, default=4096)
     ap.add_argument("--no-diff", action="store_true",
                     help="score term 1.0x instead of diff attention's 1.5x")
+    ap.add_argument("--windows", default="",
+                    help="per-layer window schedule (see GPTConfig.windows)")
+    ap.add_argument("--canon-full", action="store_true", dest="canon_full")
     args = ap.parse_args()
 
     dense = [768] * 12

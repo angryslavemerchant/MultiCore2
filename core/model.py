@@ -47,6 +47,11 @@ class GPTConfig:
     # "FGGGGFFGGGGF". Empty = every layer uses cfg.attn.
     attn_pattern: str = ""
     window: int = 512          # total window budget for S and G layers
+    # Per-layer window schedule (the pyramid): comma-separated, one entry
+    # per layer, ints for S/G layers; F layers' entries are ignored (write
+    # "F" or "0"). Empty = every windowed layer uses cfg.window. E.g. the
+    # pyramid-SWA hourglass "32,64,128,256,512,F,F,F,F,2048,1024,512".
+    windows: str = ""
     n_gates: int = 8           # G layers: FIFO gates share (window - recent_band)
     lb_coef: float = 0.0       # weight of the router load-balance aux loss
     # G layers: reserve this many of `window` as a GUARANTEED recent band
@@ -84,6 +89,13 @@ class GPTConfig:
     qk_norm: bool = False      # parameter-free RMS on q,k per head, pre-rope
     diff_attn: bool = False    # differential attention (core/diffattn.py)
     canon: bool = False        # depthwise causal conv residuals (k=4)
+    # Full A/B/C/D canon (Allen-Zhu 2025): on top of A (pre-attn) and C
+    # (pre-MLP) residual convs, B puts the conv on the concatenated q,k,v
+    # after c_attn and D on the MLP hidden after the activation. All
+    # zero-init (exact identity at init). Independent of cfg.canon so the
+    # trainer states both explicitly; B is skipped by attention classes
+    # that don't implement it (cow).
+    canon_full: bool = False
     softcap: float = 0.0       # logits = cap*tanh(logits/cap); 0 disables
     untied: bool = False       # separate wte / lm_head (lm_head zero-init)
     zero_init: bool = False    # zero-init residual c_proj (vs 1/sqrt(2L))
@@ -119,6 +131,28 @@ class GPTConfig:
         key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow"}
         return [key[c] for c in self.attn_pattern]
 
+    def layer_windows(self):
+        """Per-layer window: an int for windowed (S/G/C) layers, None for
+        full layers. Resolves cfg.windows; empty = uniform cfg.window."""
+        attns = self.layer_attns()
+        full = [k == self.attn for k in attns]
+        if not self.windows:
+            return [None if f else self.window
+                    for f, k in zip(full, attns)]
+        parts = [p.strip() for p in self.windows.split(",")]
+        assert len(parts) == self.n_layer_total(), (
+            f"windows {self.windows!r} has {len(parts)} entries for "
+            f"{self.n_layer_total()} layers")
+        out = []
+        for p, f in zip(parts, full):
+            if f:
+                out.append(None)     # full layer: entry is decorative
+                continue
+            w = int(p)
+            assert w > 0, f"windowed layer needs a positive window, got {p}"
+            out.append(w)
+        return out
+
 
 class CausalSelfAttention(DiffMixin, nn.Module):
     def __init__(self, cfg):
@@ -130,6 +164,7 @@ class CausalSelfAttention(DiffMixin, nn.Module):
         self.use_rope = cfg.pos == "rope"
         self.qk_norm = cfg.qk_norm
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        self.canon_b = Canon(3 * cfg.n_embd) if cfg.canon_full else None
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
         self.resid_dropout = nn.Dropout(cfg.dropout)
@@ -137,7 +172,10 @@ class CausalSelfAttention(DiffMixin, nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        q, k, v = self.c_attn(x).split(C, dim=2)
+        qkv = self.c_attn(x)
+        if self.canon_b is not None:
+            qkv = qkv + self.canon_b(qkv)
+        q, k, v = qkv.split(C, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -199,13 +237,19 @@ class GeluMLP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=cfg.bias)
+        self.canon_d = Canon(4 * cfg.n_embd) if cfg.canon_full else None
         self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
         self.dropout = nn.Dropout(cfg.dropout)
 
+    def _act(self, h):
+        return F.gelu(h, approximate="tanh")
+
     def forward(self, x):
-        return self.dropout(self.c_proj(F.gelu(self.c_fc(x),
-                                               approximate="tanh")))
+        h = self._act(self.c_fc(x))
+        if self.canon_d is not None:
+            h = h + self.canon_d(h)
+        return self.dropout(self.c_proj(h))
 
 
 class Relu2MLP(GeluMLP):
@@ -213,8 +257,8 @@ class Relu2MLP(GeluMLP):
     or better than GELU at this scale, and param-identical, so the
     hourglass width matcher needs no special case)."""
 
-    def forward(self, x):
-        return self.dropout(self.c_proj(F.relu(self.c_fc(x)).square()))
+    def _act(self, h):
+        return F.relu(h).square()
 
 
 class Block(nn.Module):
@@ -284,9 +328,15 @@ class GPT(nn.Module):
             wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
             h=nn.ModuleList(
-                BLOCKS[cfg.block](cfg, attn_key=key) if w == cfg.n_embd
-                else SliceBlock(cfg, key, w)
-                for key, w in zip(cfg.layer_attns(), cfg.layer_widths())),
+                BLOCKS[lcfg.block](lcfg, attn_key=key) if w == cfg.n_embd
+                else SliceBlock(lcfg, key, w)
+                for key, w, lcfg in (
+                    (key, w,
+                     cfg if win is None or win == cfg.window
+                     else replace(cfg, window=win))
+                    for key, w, win in zip(cfg.layer_attns(),
+                                           cfg.layer_widths(),
+                                           cfg.layer_windows()))),
             ln_f=make_norm(cfg, cfg.n_embd),
         )
         if cfg.pos == "learned":
@@ -380,24 +430,24 @@ class GPT(nn.Module):
         compute-matching currency between arms; router matmuls (d*G) are
         ~0.005% and ignored."""
         T = T or self.cfg.block_size
-        W = self.cfg.window
 
         def avg_keys(w):
             # mean over t in [1..T] of min(t, w): visible keys at width w
             return T if T <= w else (w * (w + 1) / 2 + (T - w) * w) / T
 
-        win_keys = avg_keys(W)
         # cow layers: raw band + at most n_gates*cow_chains live versions.
         # Upper bound (band + G*K == window by the budget assert), counted
         # as two populations because both saturate independently.
         cow_keys = (avg_keys(self.cfg.recent_band)
                     + avg_keys(self.cfg.n_gates * self.cfg.cow_chains))
-        keys_for = {"cow": cow_keys}
-        # hourglass layers score at their own (narrower) width
-        score = sum(12 * w * (T if k == self.cfg.attn
-                              else keys_for.get(k, win_keys))
-                    for k, w in zip(self.cfg.layer_attns(),
-                                    self.cfg.layer_widths()))
+        # hourglass layers score at their own (narrower) width; windowed
+        # layers at their own (per-layer, cfg.windows) window
+        score = sum(12 * w * (T if win is None
+                              else cow_keys if k == "cow"
+                              else avg_keys(win))
+                    for k, w, win in zip(self.cfg.layer_attns(),
+                                         self.cfg.layer_widths(),
+                                         self.cfg.layer_windows()))
         if self.cfg.diff_attn:
             # two half-width score passes (parity) but both attention maps
             # hit the full value width: value application doubles -> 1.5x
