@@ -48,18 +48,56 @@ from core.diffattn import DiffMixin, rms
 
 USE_FLEX = True     # module-level override for tests / debugging
 
-# flash-attn (Tri Dao kernels) for plain SWA layers: native banded
-# iteration via window_size, immune to flex's 128-tile granularity that
-# bills a w=32 window like w~200 (measured on the pyramid, 2026-07-30).
-# Optional dependency — absent or non-CUDA falls through to flex/SDPA.
+# flash kernels for plain SWA layers: native banded iteration via
+# window_size, immune to flex's 128-tile granularity that bills a w=32
+# window like w~200 (measured on the pyramid, 2026-07-30). Two sources,
+# tried in order on first CUDA forward (lazy — no network/import cost on
+# CPU or when unused):
+#   1. flash_attn (FA2, ours from source: gdrive:multicore2/wheels/)
+#   2. an HF kernels-hub build (FLASH_HUB_KERNEL env, default the
+#      community FA4 sm120 build) — probed once with a real windowed
+#      call: no window_size support or unsupported head dims -> rejected.
 # Kill switch: FLASH_SWA=0 env or core.gated_swa.USE_FLASH = False.
 USE_FLASH = os.environ.get("FLASH_SWA", "1") != "0"
-try:
-    from flash_attn import flash_attn_func as _flash_attn_func
-    _HAVE_FLASH = True
-except ImportError:
-    _flash_attn_func = None
-    _HAVE_FLASH = False
+FLASH_HUB_KERNEL = os.environ.get(
+    "FLASH_HUB_KERNEL", "SecondNatureComputing/flash-attn-4-sm120")
+_FLASH_FN = None        # resolved callable, False = resolution failed
+_HAVE_FLASH = None      # tri-state mirror for tests: None=unresolved
+
+
+def _probe(fn):
+    """One real windowed call; wrong signature / head-dim limits raise."""
+    q = torch.randn(1, 8, 2, 32, device="cuda", dtype=torch.bfloat16)
+    fn(q, q, q, causal=True, window_size=(3, 0))
+    return fn
+
+
+def _resolve_flash():
+    """Find a banded flash kernel, once. Returns callable or None."""
+    global _FLASH_FN, _HAVE_FLASH
+    if _FLASH_FN is not None:
+        return _FLASH_FN or None
+    _FLASH_FN, _HAVE_FLASH = False, False
+    try:
+        from flash_attn import flash_attn_func
+        _FLASH_FN = _probe(
+            lambda q, k, v, causal, window_size:
+            flash_attn_func(q, k, v, causal=causal,
+                            window_size=window_size))
+    except Exception:
+        try:
+            from kernels import get_kernel
+            hub = get_kernel(FLASH_HUB_KERNEL)
+
+            def _hub_fn(q, k, v, causal, window_size):
+                out = hub.flash_attn_func(q, k, v, causal=causal,
+                                          window_size=window_size)
+                return out[0] if isinstance(out, tuple) else out
+            _FLASH_FN = _probe(_hub_fn)
+        except Exception:
+            pass
+    _HAVE_FLASH = bool(_FLASH_FN)
+    return _FLASH_FN or None
 
 # Flex kernel block sizes, OPT-IN via FLEX_BLOCK_M / FLEX_BLOCK_N /
 # FLEX_NUM_STAGES env vars — needed ONLY for diff attention, whose 2*hd
@@ -249,16 +287,17 @@ class SlidingWindowAttention(DiffMixin, nn.Module):
         B, T, C = x.shape
         q, k, v = self._qkv(x)
         dropout_p = self.dropout if self.training else 0.0
-        if (USE_FLASH and _HAVE_FLASH and not self.diff
+        if (USE_FLASH and not self.diff and dropout_p == 0.0
                 and q.device.type == "cuda"
                 and q.dtype in (torch.float16, torch.bfloat16)):
-            # death(k) = k + W  <=>  q - k <= W - 1: left window W-1.
-            # flash_attn wants (B, T, H, hd).
-            y = _flash_attn_func(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                dropout_p=dropout_p, causal=True,
-                window_size=(self.window - 1, 0))
-            return self.resid_dropout(self.c_proj(y.reshape(B, T, C)))
+            flash = _resolve_flash()
+            if flash is not None:
+                # death(k) = k + W  <=>  q - k <= W - 1: left window W-1.
+                # flash kernels want (B, T, H, hd).
+                y = flash(q.transpose(1, 2), k.transpose(1, 2),
+                          v.transpose(1, 2), causal=True,
+                          window_size=(self.window - 1, 0))
+                return self.resid_dropout(self.c_proj(y.reshape(B, T, C)))
         y = self._run_attn(q, k, v, self._death(x), dropout_p,
                            cache_key=("swa", self.window))
         y = y.transpose(1, 2).contiguous().view(B, T, C)

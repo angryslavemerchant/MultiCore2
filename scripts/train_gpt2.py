@@ -310,9 +310,10 @@ def main():
         # training graph entirely (S layers -> flash, F -> SDPA causal),
         # so DDPOptimizer's graph splitting is safe again and the
         # backward/allreduce overlap comes back.
-        flash_covers = (_gsw.USE_FLASH and _gsw._HAVE_FLASH
-                        and not args.diff_attn
-                        and not any(c in args.attn_pattern for c in "GC"))
+        flash_covers = (_gsw.USE_FLASH and not args.diff_attn
+                        and not any(c in args.attn_pattern for c in "GC")
+                        and torch.cuda.is_available()
+                        and _gsw._resolve_flash() is not None)
         if ddp and not flash_covers and (
                 args.diff_attn
                 or any(c in args.attn_pattern for c in "GSC")):

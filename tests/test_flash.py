@@ -13,8 +13,8 @@ from core import gated_swa  # noqa: E402
 from core.model import GPTConfig  # noqa: E402
 
 needs_flash = pytest.mark.skipif(
-    not (torch.cuda.is_available() and gated_swa._HAVE_FLASH),
-    reason="needs CUDA + flash-attn")
+    not (torch.cuda.is_available() and gated_swa._resolve_flash()),
+    reason="needs CUDA + a working banded flash kernel")
 
 
 @needs_flash
@@ -27,9 +27,9 @@ def test_flash_window_semantics_vs_reference():
     k = torch.randn_like(q)
     v = torch.randn_like(q)
 
-    out = gated_swa._flash_attn_func(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-        causal=True, window_size=(W - 1, 0)).transpose(1, 2)
+    flash = gated_swa._resolve_flash()
+    out = flash(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                causal=True, window_size=(W - 1, 0)).transpose(1, 2)
 
     qi = torch.arange(T, device="cuda").view(T, 1)
     ki = torch.arange(T, device="cuda").view(1, T)
