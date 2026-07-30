@@ -305,8 +305,17 @@ def main():
         os.environ.setdefault("FLEX_BLOCK_N", "32")
         os.environ.setdefault("FLEX_NUM_STAGES", "2")
     if compile_ok:
-        if ddp and (args.diff_attn
-                    or any(c in args.attn_pattern for c in "GSC")):
+        from core import gated_swa as _gsw
+        # flash-attn covering every windowed layer removes flex from the
+        # training graph entirely (S layers -> flash, F -> SDPA causal),
+        # so DDPOptimizer's graph splitting is safe again and the
+        # backward/allreduce overlap comes back.
+        flash_covers = (_gsw.USE_FLASH and _gsw._HAVE_FLASH
+                        and not args.diff_attn
+                        and not any(c in args.attn_pattern for c in "GC"))
+        if ddp and not flash_covers and (
+                args.diff_attn
+                or any(c in args.attn_pattern for c in "GSC")):
             # DDPOptimizer's graph-splitting chokes on flex_attention's
             # higher-order op inside the franken graph shape ("'int'
             # object has no attribute 'meta'", 2026-07-30: single-process

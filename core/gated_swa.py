@@ -48,6 +48,19 @@ from core.diffattn import DiffMixin, rms
 
 USE_FLEX = True     # module-level override for tests / debugging
 
+# flash-attn (Tri Dao kernels) for plain SWA layers: native banded
+# iteration via window_size, immune to flex's 128-tile granularity that
+# bills a w=32 window like w~200 (measured on the pyramid, 2026-07-30).
+# Optional dependency — absent or non-CUDA falls through to flex/SDPA.
+# Kill switch: FLASH_SWA=0 env or core.gated_swa.USE_FLASH = False.
+USE_FLASH = os.environ.get("FLASH_SWA", "1") != "0"
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+    _HAVE_FLASH = True
+except ImportError:
+    _flash_attn_func = None
+    _HAVE_FLASH = False
+
 # Flex kernel block sizes, OPT-IN via FLEX_BLOCK_M / FLEX_BLOCK_N /
 # FLEX_NUM_STAGES env vars — needed ONLY for diff attention, whose 2*hd
 # value heads (v=208 at the franken's widest layers) blow the 5090's
@@ -235,8 +248,18 @@ class SlidingWindowAttention(DiffMixin, nn.Module):
     def forward(self, x):
         B, T, C = x.shape
         q, k, v = self._qkv(x)
-        y = self._run_attn(q, k, v, self._death(x),
-                           self.dropout if self.training else 0.0,
+        dropout_p = self.dropout if self.training else 0.0
+        if (USE_FLASH and _HAVE_FLASH and not self.diff
+                and q.device.type == "cuda"
+                and q.dtype in (torch.float16, torch.bfloat16)):
+            # death(k) = k + W  <=>  q - k <= W - 1: left window W-1.
+            # flash_attn wants (B, T, H, hd).
+            y = _flash_attn_func(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                dropout_p=dropout_p, causal=True,
+                window_size=(self.window - 1, 0))
+            return self.resid_dropout(self.c_proj(y.reshape(B, T, C)))
+        y = self._run_attn(q, k, v, self._death(x), dropout_p,
                            cache_key=("swa", self.window))
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
