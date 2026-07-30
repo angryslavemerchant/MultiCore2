@@ -62,11 +62,14 @@ def _flex_opts():
     if _FLEX_OPTS is None:
         bm = int(os.environ.get("FLEX_BLOCK_M", "0"))
         bn = int(os.environ.get("FLEX_BLOCK_N", "0"))
+        ns = int(os.environ.get("FLEX_NUM_STAGES", "0"))
         opts = {}
         if bm and bn:
             opts = {"BLOCK_M": bm, "BLOCK_N": bn,
                     "BLOCK_M1": bm // 2, "BLOCK_N1": bn,
                     "BLOCK_M2": bm, "BLOCK_N2": bn // 2}
+        if ns:
+            opts["num_stages"] = ns
         _FLEX_OPTS = opts
     return _FLEX_OPTS or None
 
