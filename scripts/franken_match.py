@@ -30,7 +30,8 @@ def franken_cfg(d_base, args):
         attn_pattern=args.pattern, window=args.window,
         n_gates=args.n_gates, recent_band=args.recent_band, pos="rope",
         hg_frac=args.frac, hg_bneck=args.bneck, hg_round=args.rnd,
-        norm="rms", qk_norm=True, diff_attn=True, canon=True,
+        norm="rms", qk_norm=True, diff_attn=not getattr(args, "no_diff", False),
+        canon=True,
         softcap=15.0, untied=True, zero_init=True, bias=False,
         mlp="relu2")
 
@@ -54,7 +55,8 @@ def params_and_flops(d_base, args):
         n += layer
         n_compute += layer
         score += 12 * w * (T if ch == "F" else avg_keys(cfg.window))
-    return n, 6 * n_compute + 1.5 * score
+    diff = 1.0 if getattr(args, "no_diff", False) else 1.5
+    return n, 6 * n_compute + diff * score
 
 
 def main():
@@ -67,6 +69,8 @@ def main():
     ap.add_argument("--n-gates", type=int, default=4)
     ap.add_argument("--recent-band", type=int, default=128)
     ap.add_argument("--T", type=int, default=4096)
+    ap.add_argument("--no-diff", action="store_true",
+                    help="score term 1.0x instead of diff attention's 1.5x")
     args = ap.parse_args()
 
     dense = [768] * 12
