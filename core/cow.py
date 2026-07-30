@@ -61,6 +61,162 @@ except ImportError:
 
 # --------------------------------------------------------------- chain scan
 @torch.no_grad()
+def _scan_chunk(kc, gc, pos_c, c1_t, head_key, head_pos, birth_id,
+                gate_arange, G, K, T, theta, n_jumps):
+    """One chunk of the scan: compare, resolve roots, reconcile state.
+
+    Branchless and static-shaped BY DESIGN: this function is
+    torch.compile'd (fullgraph) on CUDA so the 32 sequential chunk steps
+    cost a few fused kernels each instead of ~35 eager dispatches -- the
+    eager version measured 3.3 s/iter on 8x5090 (5x the hybrid arm), all
+    launch latency. c1_t (chunk end) must stay a TENSOR: as a python int
+    it would burn one recompile per chunk.
+
+    Returns (cid, n_birth_row, evict_upd, n_evict_row, head_key,
+    head_pos, birth_id).
+    """
+    B, m, C = kc.shape
+    GK = G * K
+
+    # --- similarities to frozen heads (own gate, alive only) -------------
+    sim_h = torch.einsum("bmc,bgkc->bmgk", kc, head_key)   # (B,m,G,K)
+    own = F.one_hot(gc, G).bool().unsqueeze(-1)            # (B,m,G,1)
+    alive = (head_pos >= 0).unsqueeze(1)                   # (B,1,G,K)
+    sim_h = torch.where(own & alive, sim_h, torch.full_like(sim_h, -2.0))
+    sim_h = sim_h.reshape(B, m, GK)
+
+    # --- similarities to earlier same-gate tokens in this chunk ----------
+    # Eligible in-chunk candidates are tokens that did NOT merge into a
+    # frozen head: members of FRESH chains only. A token similar to an
+    # existing chain's within-chunk member (but not its frozen head)
+    # births instead of merging -- the error lands on the birth side, the
+    # recoverable side of the Neocore asymmetry. Without this the
+    # in-chunk superset ("match ANY earlier member") halves the birth
+    # rate at chunk=128 (measured on random keys).
+    head_merged = sim_h.max(dim=-1).values >= theta         # (B,m)
+    sim_t = torch.einsum("bmc,bnc->bmn", kc, kc)           # (B,m,m)
+    tri = torch.ones(m, m, dtype=torch.bool, device=kc.device).tril(-1)
+    same_gate = gc.unsqueeze(-1) == gc.unsqueeze(1)
+    elig = tri & same_gate & ~head_merged.unsqueeze(1)
+    sim_t = torch.where(elig, sim_t, torch.full_like(sim_t, -2.0))
+
+    # --- best candidate over both populations ----------------------------
+    sim_all = torch.cat([sim_h, sim_t], dim=-1)            # (B,m,GK+m)
+    best_sim, best_idx = sim_all.max(dim=-1)
+    merge = best_sim >= theta                               # (B, m)
+    to_head = merge & (best_idx < GK)
+    to_tok = merge & (best_idx >= GK)
+
+    # --- resolve chain ids: pointer-doubling to each token's root --------
+    self_idx = torch.arange(m, device=kc.device).expand(B, m)
+    parent = torch.where(to_tok, best_idx - GK, self_idx)
+    for _ in range(n_jumps):
+        parent = parent.gather(1, parent)                   # doubling
+    root = parent                                           # (B,m)
+    root_to_head = to_head.gather(1, root)
+    root_head_idx = best_idx.gather(1, root).clamp(max=GK - 1)
+    head_chain = birth_id.reshape(B, GK).gather(1, root_head_idx)
+    root_pos = pos_c.gather(1, root)
+    cid = torch.where(root_to_head, head_chain, root_pos)
+    is_birth = (~to_head) & (~to_tok)                       # own root
+
+    # --- reconcile state at the boundary ---------------------------------
+    # 1) existing chains that got merges: newest member this chunk.
+    flat_bid = birth_id.reshape(B, GK)                      # (B,GK)
+    match = (cid.unsqueeze(-1) == flat_bid.unsqueeze(1)) \
+        & (flat_bid.unsqueeze(1) >= 0)                      # (B,m,GK)
+    newest = torch.where(match, pos_c.unsqueeze(-1),
+                         torch.full_like(match, -1, dtype=torch.long))
+    upd_pos, upd_tok = newest.max(dim=1)                    # (B,GK)
+    has_upd = upd_pos >= 0
+    upd_key = kc.gather(1, upd_tok.clamp(min=0)
+                        .unsqueeze(-1).expand(-1, -1, C))   # (B,GK,C)
+    head_key = torch.where(has_upd.reshape(B, G, K, 1),
+                           upd_key.reshape(B, G, K, C), head_key)
+    head_pos = torch.where(has_upd.reshape(B, G, K),
+                           upd_pos.reshape(B, G, K), head_pos)
+
+    # 2) fresh chains born this chunk: newest member of each.
+    same_new = cid.unsqueeze(1) == pos_c.unsqueeze(-1)      # (B,m,m)
+    memb_pos = torch.where(same_new, pos_c.unsqueeze(1),
+                           torch.full_like(same_new, -1, dtype=torch.long))
+    new_last, new_last_tok = memb_pos.max(dim=2)            # (B,m)
+    new_key = kc.gather(1, new_last_tok.clamp(min=0)
+                        .unsqueeze(-1).expand(-1, -1, C))
+
+    # 3) per gate: pool existing + births, keep the newest K.
+    neg1 = torch.full_like(pos_c, -1)
+    pool_pos = torch.cat([head_pos.reshape(B, GK),
+                          torch.where(is_birth, new_last, neg1)], 1)
+    pool_gate = torch.cat([gate_arange.expand(B, -1), gc], 1)
+    pool_bid = torch.cat([flat_bid,
+                          torch.where(is_birth, pos_c, neg1)], 1)
+    pool_key = torch.cat([head_key.reshape(B, GK, C), new_key], 1)
+
+    dead = pool_pos < 0
+    span = 2 * T + 2
+    rank_key = pool_gate * span + (T - pool_pos)            # small=newer
+    rank_key = torch.where(dead, torch.full_like(rank_key, G * span),
+                           rank_key)
+    order = rank_key.argsort(dim=1)                          # (B,GK+m)
+    srt_gate = pool_gate.gather(1, order)
+    src_pos = pool_pos.gather(1, order)
+    src_bid = pool_bid.gather(1, order)
+    src_key = pool_key.gather(1, order.unsqueeze(-1).expand(-1, -1, C))
+    # index within each gate's sorted run: 0,1,2.. resetting per gate.
+    run = torch.zeros_like(srt_gate)
+    run[:, 1:] = (srt_gate[:, 1:] == srt_gate[:, :-1]).long()
+    csum = run.cumsum(1)
+    start_val = torch.where(run == 0, csum, torch.zeros_like(csum))
+    idx_in_gate = csum - start_val.cummax(1).values
+    keep_sorted = (idx_in_gate < K) & (src_pos >= 0)
+
+    # evictions, branchless: alive-but-not-kept entries write their chunk
+    # end into a T+1-wide amin buffer (dummy column T absorbs the rest).
+    evicted = (src_pos >= 0) & ~keep_sorted
+    ev_idx = torch.where(evicted, src_bid, torch.full_like(src_bid, T))
+    ev_val = torch.where(evicted, c1_t.expand_as(src_bid),
+                         torch.full_like(src_bid, T))
+    evict_upd = torch.full((B, T + 1), T, dtype=torch.long,
+                           device=kc.device)
+    evict_upd.scatter_reduce_(1, ev_idx, ev_val, reduce="amin")
+
+    # 4) rebuild packed state: kept entries scatter to their slot, all
+    # others collide harmlessly on dummy slot GK.
+    dst = torch.where(keep_sorted, srt_gate * K + idx_in_gate.clamp(max=K - 1),
+                      torch.full_like(idx_in_gate, GK))
+    new_hp = torch.full((B, GK + 1), -1, dtype=torch.long, device=kc.device)
+    new_bi = torch.full((B, GK + 1), -1, dtype=torch.long, device=kc.device)
+    new_hk = torch.zeros(B, GK + 1, C, device=kc.device)
+    new_hp.scatter_(1, dst, torch.where(keep_sorted, src_pos, neg1[:, :1]
+                                        .expand_as(src_pos)))
+    new_bi.scatter_(1, dst, torch.where(keep_sorted, src_bid, neg1[:, :1]
+                                        .expand_as(src_bid)))
+    new_hk.scatter_(1, dst.unsqueeze(-1).expand(-1, -1, C),
+                    torch.where(keep_sorted.unsqueeze(-1), src_key,
+                                torch.zeros_like(src_key)))
+
+    return (cid, is_birth.float().sum(1), evict_upd[:, :T],
+            evicted.float().sum(1), new_hk[:, :GK].reshape(B, G, K, C),
+            new_hp[:, :GK].reshape(B, G, K),
+            new_bi[:, :GK].reshape(B, G, K))
+
+
+COMPILE_SCAN = True          # module-level override for tests / debugging
+_scan_chunk_compiled = None
+
+
+def _get_scan_step(is_cuda):
+    global _scan_chunk_compiled
+    if not (COMPILE_SCAN and is_cuda):
+        return _scan_chunk
+    if _scan_chunk_compiled is None:
+        _scan_chunk_compiled = torch.compile(_scan_chunk, fullgraph=True,
+                                             dynamic=False)
+    return _scan_chunk_compiled
+
+
+@torch.no_grad()
 def cow_chain_scan(keys, gate, n_gates, n_chains, theta, chunk=128):
     """Chunked copy-on-write chain-membership scan.
 
@@ -85,13 +241,17 @@ def cow_chain_scan(keys, gate, n_gates, n_chains, theta, chunk=128):
         only bites on cross-chunk boundaries;
       * eviction applies at chunk boundaries -- a gate may transiently
         hold more than K chains inside a chunk.
+
+    The driver loop is dynamo-disabled with recursive=False: the outer
+    model compile skips this frame (python loop, data-dependent state),
+    while the inner per-chunk step still hits its own torch.compile.
+    recursive=True would silently downgrade the step to eager.
     """
     B, T, C = keys.shape
     device = keys.device
     G, K = n_gates, n_chains
     kn = F.normalize(keys.float(), dim=-1)
 
-    # live-chain state, vectorized over (B, G, K); pos -1 = dead slot
     head_key = torch.zeros(B, G, K, C, device=device)
     head_pos = torch.full((B, G, K), -1, dtype=torch.long, device=device)
     birth_id = torch.full((B, G, K), -1, dtype=torch.long, device=device)
@@ -101,134 +261,21 @@ def cow_chain_scan(keys, gate, n_gates, n_chains, theta, chunk=128):
     n_births = torch.zeros(B, device=device)
     n_evicts = torch.zeros(B, device=device)
     gate_arange = torch.arange(G, device=device).repeat_interleave(K)
+    pos_all = torch.arange(T, device=device).expand(B, T)
+    n_jumps = max(1, (chunk - 1).bit_length())
+    step = _get_scan_step(keys.is_cuda)
 
     for c0 in range(0, T, chunk):
         c1 = min(c0 + chunk, T)
-        m = c1 - c0
-        kc = kn[:, c0:c1]                                # (B, m, C)
-        gc = gate[:, c0:c1]                              # (B, m)
-        pos_c = torch.arange(c0, c1, device=device).expand(B, m)
-
-        # --- similarities to frozen heads (own gate, alive only) ---------
-        sim_h = torch.einsum("bmc,bgkc->bmgk", kc, head_key)   # (B,m,G,K)
-        own = F.one_hot(gc, G).bool().unsqueeze(-1)            # (B,m,G,1)
-        alive = (head_pos >= 0).unsqueeze(1)                   # (B,1,G,K)
-        sim_h = torch.where(own & alive, sim_h, torch.full_like(sim_h, -2.0))
-        sim_h = sim_h.reshape(B, m, G * K)
-
-        # --- similarities to earlier same-gate tokens in this chunk ------
-        # Eligible in-chunk candidates are tokens that did NOT merge into a
-        # frozen head: members of FRESH chains only. A token similar to an
-        # existing chain's within-chunk member (but not its frozen head)
-        # births instead of merging -- the error lands on the birth side,
-        # the recoverable side of the Neocore asymmetry. Without this the
-        # in-chunk superset ("match ANY earlier member") halves the birth
-        # rate at chunk=128 (measured on random keys).
-        head_merged = sim_h.max(dim=-1).values >= theta         # (B,m)
-        sim_t = torch.einsum("bmc,bnc->bmn", kc, kc)           # (B,m,m)
-        tri = torch.ones(m, m, dtype=torch.bool, device=device).tril(-1)
-        same_gate = gc.unsqueeze(-1) == gc.unsqueeze(1)
-        elig = tri & same_gate & ~head_merged.unsqueeze(1)
-        sim_t = torch.where(elig, sim_t, torch.full_like(sim_t, -2.0))
-
-        # --- best candidate over both populations -------------------------
-        sim_all = torch.cat([sim_h, sim_t], dim=-1)            # (B,m,GK+m)
-        best_sim, best_idx = sim_all.max(dim=-1)
-        merge = best_sim >= theta                               # (B, m)
-        to_head = merge & (best_idx < G * K)
-        to_tok = merge & (best_idx >= G * K)
-
-        # --- resolve chain ids: pointer-doubling to each token's root ----
-        # parent: chunk-local index of the earlier token this one chained
-        # to, or self for head-mergers and birthers (both are roots).
-        self_idx = torch.arange(m, device=device).expand(B, m)
-        parent = torch.where(to_tok, best_idx - G * K, self_idx)
-        for _ in range(max(1, (m - 1).bit_length())):
-            parent = parent.gather(1, parent)                   # doubling
-        root = parent                                           # (B,m)
-        root_to_head = to_head.gather(1, root)
-        root_head_idx = best_idx.gather(1, root).clamp(max=G * K - 1)
-        head_chain = birth_id.reshape(B, G * K).gather(1, root_head_idx)
-        root_pos = pos_c.gather(1, root)
-        cid = torch.where(root_to_head, head_chain, root_pos)
+        c1_t = torch.full((1,), c1, dtype=torch.long, device=device)
+        (cid, nb, evict_upd, ne, head_key, head_pos, birth_id) = step(
+            kn[:, c0:c1], gate[:, c0:c1], pos_all[:, c0:c1], c1_t,
+            head_key, head_pos, birth_id, gate_arange, G, K, T, theta,
+            n_jumps)
         chain_id[:, c0:c1] = cid
-        is_birth = (~to_head) & (~to_tok)                       # own root
-        n_births += is_birth.float().sum(1)
-
-        # --- reconcile state at the boundary -------------------------------
-        # 1) existing chains that got merges: newest member this chunk.
-        flat_bid = birth_id.reshape(B, G * K)                   # (B,GK)
-        match = (cid.unsqueeze(-1) == flat_bid.unsqueeze(1)) \
-            & (flat_bid.unsqueeze(1) >= 0)                      # (B,m,GK)
-        newest = torch.where(match, pos_c.unsqueeze(-1),
-                             torch.full_like(match, -1, dtype=torch.long))
-        upd_pos, upd_tok = newest.max(dim=1)                    # (B,GK)
-        has_upd = upd_pos >= 0
-        upd_key = kc.gather(1, upd_tok.clamp(min=0)
-                            .unsqueeze(-1).expand(-1, -1, C))   # (B,GK,C)
-        head_key = torch.where(has_upd.reshape(B, G, K, 1),
-                               upd_key.reshape(B, G, K, C), head_key)
-        head_pos = torch.where(has_upd.reshape(B, G, K),
-                               upd_pos.reshape(B, G, K), head_pos)
-
-        # 2) fresh chains born this chunk: newest member of each.
-        same_new = cid.unsqueeze(1) == pos_c.unsqueeze(-1)      # (B,m,m)
-        memb_pos = torch.where(same_new, pos_c.unsqueeze(1),
-                               torch.full_like(same_new, -1,
-                                               dtype=torch.long))
-        new_last, new_last_tok = memb_pos.max(dim=2)            # (B,m)
-        new_key = kc.gather(1, new_last_tok.clamp(min=0)
-                            .unsqueeze(-1).expand(-1, -1, C))
-
-        # 3) per gate: pool existing + births, keep the newest K.
-        neg1 = torch.full_like(pos_c, -1)
-        pool_pos = torch.cat([head_pos.reshape(B, G * K),
-                              torch.where(is_birth, new_last, neg1)], 1)
-        pool_gate = torch.cat([gate_arange.expand(B, -1), gc], 1)
-        pool_bid = torch.cat([flat_bid,
-                              torch.where(is_birth, pos_c, neg1)], 1)
-        pool_key = torch.cat([head_key.reshape(B, G * K, C), new_key], 1)
-
-        dead = pool_pos < 0
-        span = 2 * T + 2
-        rank_key = pool_gate * span + (T - pool_pos)            # small=newer
-        rank_key = torch.where(dead, torch.full_like(rank_key, G * span),
-                               rank_key)
-        order = rank_key.argsort(dim=1)                          # (B,GK+m)
-        srt_gate = pool_gate.gather(1, order)
-        # index within each gate's sorted run: 0,1,2.. resetting per gate.
-        run = torch.zeros_like(srt_gate)
-        run[:, 1:] = (srt_gate[:, 1:] == srt_gate[:, :-1]).long()
-        csum = run.cumsum(1)
-        start_val = torch.where(run == 0, csum, torch.zeros_like(csum))
-        idx_in_gate = csum - start_val.cummax(1).values
-        keep_sorted = (idx_in_gate < K) & (pool_pos.gather(1, order) >= 0)
-        keep = torch.zeros_like(keep_sorted)
-        keep.scatter_(1, order, keep_sorted)
-
-        evicted = (pool_pos >= 0) & ~keep
-        n_evicts += evicted.float().sum(1)
-        if evicted.any():
-            b_idx = (torch.arange(B, device=device).unsqueeze(1)
-                     .expand_as(pool_bid))[evicted]
-            ev_bid = pool_bid[evicted]
-            evict_pos[b_idx, ev_bid] = torch.minimum(
-                evict_pos[b_idx, ev_bid], torch.full_like(ev_bid, c1))
-
-        # 4) rebuild packed state from kept entries.
-        new_hk = torch.zeros_like(head_key).reshape(B, G * K, C)
-        new_hp = torch.full_like(head_pos, -1).reshape(B, G * K)
-        new_bi = torch.full_like(birth_id, -1).reshape(B, G * K)
-        dst = srt_gate * K + idx_in_gate.clamp(max=K - 1)
-        ks = keep_sorted
-        bi = torch.arange(B, device=device).unsqueeze(1).expand_as(dst)
-        new_hp[bi[ks], dst[ks]] = pool_pos.gather(1, order)[ks]
-        new_bi[bi[ks], dst[ks]] = pool_bid.gather(1, order)[ks]
-        new_hk[bi[ks], dst[ks]] = pool_key.gather(
-            1, order.unsqueeze(-1).expand(-1, -1, C))[ks]
-        head_key = new_hk.reshape(B, G, K, C)
-        head_pos = new_hp.reshape(B, G, K)
-        birth_id = new_bi.reshape(B, G, K)
+        evict_pos = torch.minimum(evict_pos, evict_upd)
+        n_births += nb
+        n_evicts += ne
 
     live = (head_pos >= 0).float().sum((1, 2))
     stats = {
@@ -240,6 +287,9 @@ def cow_chain_scan(keys, gate, n_gates, n_chains, theta, chunk=128):
         "mean_chain_len": float(T / max(n_births.mean().item(), 1.0)),
     }
     return chain_id, evict_pos, stats
+
+
+cow_chain_scan = torch.compiler.disable(cow_chain_scan, recursive=False)
 
 
 def cow_death_times(chain_id, evict_pos):
@@ -317,7 +367,12 @@ def _build_cow_block_mask(death, band, B, T, device):
 
 
 if _HAVE_FLEX:
-    _build_cow_block_mask = torch.compiler.disable(_build_cow_block_mask)
+    # recursive=False: the outer model compile must skip this frame (the
+    # data-dependent-mask gotcha), but create_block_mask's own
+    # _compile=True path must still engage -- recursive=True would
+    # silently run the memory-hungry eager builder.
+    _build_cow_block_mask = torch.compiler.disable(_build_cow_block_mask,
+                                                   recursive=False)
 
 
 # ---------------------------------------------------------------- attention
