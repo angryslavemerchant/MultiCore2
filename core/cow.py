@@ -295,14 +295,25 @@ def cow_interval_mask(death, band, T):
 
 def _build_cow_block_mask(death, band, B, T, device):
     """BlockMask over 2T keys. Built EAGERLY (compiler.disable) -- death is
-    data-dependent; see core.gated_swa._build_block_mask's warning."""
+    data-dependent; see core.gated_swa._build_block_mask's warning.
+
+    _compile=True is load-bearing for MEMORY, not speed: the eager
+    create_block_mask materializes the dense (B,1,T,2T) index grids in
+    int64 -- ~4 GiB at B=16/T=4096 -- which OOMed rank 4 on the first COW
+    launch (2026-07-30, 27.9/31.4 GiB in use). The compiled builder
+    evaluates mask_mod blockwise. This is an explicit torch.compile of the
+    BUILDER only, still outside the model's graph -- a different path from
+    the data-dependent-mask-inside-compiled-graph corruption the eager
+    rule guards against; compiled-vs-eager was re-verified on the box
+    after this change."""
     def mask_mod(b, h, qi, ki):
         raw = (ki <= qi) & (qi < ki + band)
         kt = (ki - T).clamp(min=0)
         arch = (kt + band <= qi) & (qi < death[b, kt])
         return torch.where(ki < T, raw, arch)
 
-    return create_block_mask(mask_mod, B, 1, T, 2 * T, device=str(device))
+    return create_block_mask(mask_mod, B, 1, T, 2 * T, device=str(device),
+                             _compile=True)
 
 
 if _HAVE_FLEX:
