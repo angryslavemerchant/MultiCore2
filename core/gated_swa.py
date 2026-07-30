@@ -78,24 +78,42 @@ def _resolve_flash():
     if _FLASH_FN is not None:
         return _FLASH_FN or None
     _FLASH_FN, _HAVE_FLASH = False, False
-    try:
-        from flash_attn import flash_attn_func
-        _FLASH_FN = _probe(
-            lambda q, k, v, causal, window_size:
-            flash_attn_func(q, k, v, causal=causal,
-                            window_size=window_size))
-    except Exception:
-        try:
-            from kernels import get_kernel
-            hub = get_kernel(FLASH_HUB_KERNEL)
 
-            def _hub_fn(q, k, v, causal, window_size):
-                out = hub.flash_attn_func(q, k, v, causal=causal,
-                                          window_size=window_size)
-                return out[0] if isinstance(out, tuple) else out
-            _FLASH_FN = _probe(_hub_fn)
+    def _fa2():
+        from flash_attn import flash_attn_func
+        return (lambda q, k, v, causal, window_size:
+                flash_attn_func(q, k, v, causal=causal,
+                                window_size=window_size))
+
+    def _xformers():
+        # official Meta wheels track torch releases — the one banded
+        # kernel source with no ABI/build pain (verified torch 2.12+cu130
+        # sm120, 2026-07-30). window_right=0 + left=W-1 == death(k)=k+W.
+        from xformers.ops import fmha, memory_efficient_attention
+
+        def fn(q, k, v, causal, window_size):
+            mask = fmha.attn_bias.LocalAttentionFromBottomRightMask(
+                window_left=window_size[0], window_right=0)
+            return memory_efficient_attention(q, k, v, attn_bias=mask)
+        return fn
+
+    def _hub():
+        from kernels import get_kernel
+        hub = get_kernel(FLASH_HUB_KERNEL, trust_remote_code=True,
+                         revision="main")
+
+        def fn(q, k, v, causal, window_size):
+            out = hub.flash_attn_func(q, k, v, causal=causal,
+                                      window_size=window_size)
+            return out[0] if isinstance(out, tuple) else out
+        return fn
+
+    for candidate in (_fa2, _xformers, _hub):
+        try:
+            _FLASH_FN = _probe(candidate())
+            break
         except Exception:
-            pass
+            continue
     _HAVE_FLASH = bool(_FLASH_FN)
     return _FLASH_FN or None
 
