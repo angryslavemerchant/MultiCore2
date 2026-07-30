@@ -27,6 +27,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from core.diffattn import DiffMixin, rms
+
 
 @dataclass
 class GPTConfig:
@@ -67,18 +69,31 @@ class GPTConfig:
     hg_frac: float = 0.0
     hg_bneck: int = 8
     hg_mid: int = 0
+    # width rounding for layer_widths(); 24 keeps 12 heads at even head_dim
+    # (the phase-3 arms), 96 keeps head_dim a multiple of 8 — required for
+    # the franken run where every hourglass width goes through flex
+    hg_round: int = 24
     # COW archive (attn="cow" / pattern letter C): recent_band raw keys +
     # n_gates*cow_chains live chain versions == window total budget.
     cow_chains: int = 32       # K live chains per gate
     cow_theta: float = 0.7     # vigilance: best cosine >= theta -> merge
     cow_chunk: int = 128       # chain-scan chunk (heads frozen within)
+    # Frankenstein stack (2026-07-30). Every default is OFF so earlier
+    # arms' checkpoint configs round-trip unchanged.
+    norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
+    qk_norm: bool = False      # parameter-free RMS on q,k per head, pre-rope
+    diff_attn: bool = False    # differential attention (core/diffattn.py)
+    canon: bool = False        # depthwise causal conv residuals (k=4)
+    softcap: float = 0.0       # logits = cap*tanh(logits/cap); 0 disables
+    untied: bool = False       # separate wte / lm_head (lm_head zero-init)
+    zero_init: bool = False    # zero-init residual c_proj (vs 1/sqrt(2L))
 
     def n_layer_total(self):
         return self.n_layer + (self.hg_mid if self.hg_frac else 0)
 
-    def layer_widths(self, rnd=24):
-        """Per-layer residual read/write width. Rounded to `rnd` (24 keeps
-        12 heads with an even head_dim, which rope requires)."""
+    def layer_widths(self, rnd=None):
+        """Per-layer residual read/write width, rounded to cfg.hg_round."""
+        rnd = rnd or self.hg_round
         if not self.hg_frac:
             return [self.n_embd] * self.n_layer
         ws = []
@@ -105,7 +120,7 @@ class GPTConfig:
         return [key[c] for c in self.attn_pattern]
 
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention(DiffMixin, nn.Module):
     def __init__(self, cfg):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
@@ -113,10 +128,12 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = cfg.n_embd
         self.dropout = cfg.dropout
         self.use_rope = cfg.pos == "rope"
+        self.qk_norm = cfg.qk_norm
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
         self.resid_dropout = nn.Dropout(cfg.dropout)
+        self._init_diff(cfg)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -124,14 +141,58 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        if self.qk_norm:
+            q, k = rms(q), rms(k)
         if self.use_rope:
             from core.rope import apply_rope
             q, k = apply_rope(q, k)
-        y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True,
-            dropout_p=self.dropout if self.training else 0.0)
+        dropout_p = self.dropout if self.training else 0.0
+        if self.diff:
+            # full-causal death (k + T >= T: nothing ever dies) reuses the
+            # interval machinery so both diff passes share one cached mask
+            from core.gated_swa import _prepare_attend, swa_death_times
+            death = swa_death_times(T, T, x.device).expand(B, T)
+            attend = _prepare_attend(death, B, T, x.device,
+                                     cache_key=("causal",))
+            y = self._diff_attend(attend, q, k, v, dropout_p)
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, dropout_p=dropout_p)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
+
+
+class RMSNorm(nn.Module):
+    """Weight-only RMS norm, fp32 compute (the speedrun/Llama norm)."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x.float(), (x.shape[-1],),
+                          self.weight.float()).type_as(x)
+
+
+def make_norm(cfg, dim):
+    return (RMSNorm(dim) if cfg.norm == "rms"
+            else nn.LayerNorm(dim, bias=cfg.bias))
+
+
+class Canon(nn.Module):
+    """Canon layer (Allen-Zhu 2025): depthwise causal conv residual,
+    kernel 4 (current + 3 past tokens), zero-init so it starts as the
+    identity. Cheap local token mixing ahead of attention and the MLP."""
+
+    def __init__(self, dim, kernel=4):
+        super().__init__()
+        self.kernel = kernel
+        self.conv = nn.Conv1d(dim, dim, kernel, groups=dim, bias=False)
+        nn.init.zeros_(self.conv.weight)
+
+    def forward(self, x):
+        y = F.pad(x.transpose(1, 2), (self.kernel - 1, 0))
+        return self.conv(y).transpose(1, 2)
 
 
 class GeluMLP(nn.Module):
@@ -147,18 +208,35 @@ class GeluMLP(nn.Module):
                                                approximate="tanh")))
 
 
+class Relu2MLP(GeluMLP):
+    """Same shapes, ReLU^2 activation (the speedrun MLP — measured equal
+    or better than GELU at this scale, and param-identical, so the
+    hourglass width matcher needs no special case)."""
+
+    def forward(self, x):
+        return self.dropout(self.c_proj(F.relu(self.c_fc(x)).square()))
+
+
 class Block(nn.Module):
     """Pre-LN transformer block: x + attn(ln(x)), then x + mlp(ln(x))."""
 
     def __init__(self, cfg, attn_key=None):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
+        self.use_canon = cfg.canon
+        if cfg.canon:
+            self.canon_a = Canon(cfg.n_embd)
+            self.canon_c = Canon(cfg.n_embd)
+        self.ln_1 = make_norm(cfg, cfg.n_embd)
         self.attn = ATTENTIONS[attn_key or cfg.attn](cfg)
-        self.ln_2 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
+        self.ln_2 = make_norm(cfg, cfg.n_embd)
         self.mlp = MLPS[cfg.mlp](cfg)
 
     def forward(self, x):
+        if self.use_canon:
+            x = x + self.canon_a(x)
         x = x + self.attn(self.ln_1(x))
+        if self.use_canon:
+            x = x + self.canon_c(x)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -193,7 +271,7 @@ ATTENTIONS = {"causal": CausalSelfAttention,
               "swa": SlidingWindowAttention,
               "gated": GatedSWAttention,
               "cow": COWAttention}
-MLPS = {"gelu": GeluMLP}
+MLPS = {"gelu": GeluMLP, "relu2": Relu2MLP}
 BLOCKS = {"gpt2": Block}
 
 
@@ -209,21 +287,36 @@ class GPT(nn.Module):
                 BLOCKS[cfg.block](cfg, attn_key=key) if w == cfg.n_embd
                 else SliceBlock(cfg, key, w)
                 for key, w in zip(cfg.layer_attns(), cfg.layer_widths())),
-            ln_f=nn.LayerNorm(cfg.n_embd, bias=cfg.bias),
+            ln_f=make_norm(cfg, cfg.n_embd),
         )
         if cfg.pos == "learned":
             modules["wpe"] = nn.Embedding(cfg.block_size, cfg.n_embd)
         self.transformer = nn.ModuleDict(modules)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight   # tied
+        if not cfg.untied:
+            self.transformer.wte.weight = self.lm_head.weight   # tied
 
         self.apply(self._init_weights)
-        # GPT-2 paper: scale residual-projection init by 1/sqrt(N residual
-        # additions) so the stream's variance is depth-independent.
+        if cfg.untied:
+            # speedrun: untied head starts at zero — logits are exactly 0
+            # (uniform prediction) at init and the head learns from scratch
+            nn.init.zeros_(self.lm_head.weight)
         for name, p in self.named_parameters():
             if name.endswith("c_proj.weight"):
-                nn.init.normal_(p, mean=0.0,
-                                std=0.02 / math.sqrt(2 * cfg.n_layer_total()))
+                if cfg.zero_init:
+                    # speedrun: residual branches start as strict no-ops
+                    nn.init.zeros_(p)
+                else:
+                    # GPT-2 paper: scale residual-projection init by
+                    # 1/sqrt(N residual additions) so the stream's variance
+                    # is depth-independent.
+                    nn.init.normal_(
+                        p, mean=0.0,
+                        std=0.02 / math.sqrt(2 * cfg.n_layer_total()))
+        # diff attention: per-layer lambda_init depth schedule
+        for i, blk in enumerate(self.transformer.h):
+            if hasattr(blk.attn, "set_depth"):
+                blk.attn.set_depth(i)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -244,9 +337,14 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+
+        def cap(lg):
+            return (self.cfg.softcap * torch.tanh(lg / self.cfg.softcap)
+                    if self.cfg.softcap else lg)
+
         if targets is None:
-            return self.lm_head(x[:, [-1], :]), None
-        logits = self.lm_head(x)
+            return cap(self.lm_head(x[:, [-1], :])), None
+        logits = cap(self.lm_head(x))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                targets.reshape(-1))
         # Aux term only while TRAINING: val loss is the cross-arm judge and
@@ -260,11 +358,14 @@ class GPT(nn.Module):
 
     # ------------------------------------------------------------- accounting
     def num_params(self, non_embedding=True):
-        """Parameter count. `non_embedding` drops wpe (wte stays: it is tied
-        to lm_head, which does real compute)."""
+        """Parameter count. `non_embedding` drops wpe, and — when untied —
+        wte too: both are pure lookups. (Tied wte stays: it IS lm_head,
+        which does real compute.) This is the N that 6*N FLOPs sees."""
         n = sum(p.numel() for p in self.parameters())
         if non_embedding and self.cfg.pos == "learned":
             n -= self.transformer.wpe.weight.numel()
+        if non_embedding and self.cfg.untied:
+            n -= self.transformer.wte.weight.numel()
         return n
 
     def flops_per_token(self, T=None):
@@ -297,17 +398,49 @@ class GPT(nn.Module):
                               else keys_for.get(k, win_keys))
                     for k, w in zip(self.cfg.layer_attns(),
                                     self.cfg.layer_widths()))
+        if self.cfg.diff_attn:
+            # two half-width score passes (parity) but both attention maps
+            # hit the full value width: value application doubles -> 1.5x
+            # on the attention term
+            score *= 1.5
         return 6 * self.num_params() + score
 
-    def configure_optimizers(self, weight_decay, lr, betas, device_type):
-        """AdamW with weight decay on >=2D params only (no decay on biases,
-        layernorms, embeddings-as-1D), fused on CUDA."""
-        params = [p for p in self.parameters() if p.requires_grad]
-        decay = [p for p in params if p.dim() >= 2]
-        no_decay = [p for p in params if p.dim() < 2]
+    def configure_optimizers(self, weight_decay, lr, betas, device_type,
+                             opt="adamw", muon_lr=0.02):
+        """opt="adamw": AdamW with weight decay on >=2D params only (no
+        decay on biases, layernorms, embeddings-as-1D), fused on CUDA.
+
+        opt="muon": Muon over the 2D hidden matrices inside the blocks,
+        AdamW over everything else (embeddings, lm_head, norms, canon
+        convs, diff lambdas). Each param group carries lr_scale so the
+        trainer's one schedule drives both optimizers:
+        group lr = schedule(step) * lr_scale, with Muon's base rate at
+        muon_lr while the schedule is expressed in AdamW units."""
+        params = [(n, p) for n, p in self.named_parameters()
+                  if p.requires_grad]
+        fused = device_type == "cuda"
+        if opt == "muon":
+            from core.muon import Muon, ComboOptimizer
+            hidden = [p for n, p in params
+                      if p.dim() == 2 and n.startswith("transformer.h.")]
+            hid_ids = {id(p) for p in hidden}
+            rest = [p for _, p in params if id(p) not in hid_ids]
+            decay = [p for p in rest if p.dim() >= 2]
+            no_decay = [p for p in rest if p.dim() < 2]
+            muon = Muon(hidden, lr=muon_lr, momentum=0.95)
+            adamw = torch.optim.AdamW(
+                [{"params": decay, "weight_decay": weight_decay},
+                 {"params": no_decay, "weight_decay": 0.0}],
+                lr=lr, betas=betas, fused=fused)
+            for g in muon.param_groups:
+                g["lr_scale"] = muon_lr / lr
+            for g in adamw.param_groups:
+                g["lr_scale"] = 1.0
+            return ComboOptimizer([muon, adamw])
+        decay = [p for _, p in params if p.dim() >= 2]
+        no_decay = [p for _, p in params if p.dim() < 2]
         groups = [{"params": decay, "weight_decay": weight_decay},
                   {"params": no_decay, "weight_decay": 0.0}]
-        fused = device_type == "cuda"
         return torch.optim.AdamW(groups, lr=lr, betas=betas, fused=fused)
 
     @torch.no_grad()

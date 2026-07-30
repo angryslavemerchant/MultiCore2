@@ -31,6 +31,11 @@ def main():
     ap.add_argument("--no-flex", action="store_true")
     ap.add_argument("--compile-only", action="store_true",
                     help="skip density stats; just the compile check")
+    ap.add_argument("--franken", action="store_true",
+                    help="build the full Frankenstein config (diff attn, "
+                         "canon, rms, qk-norm, relu2, untied, zero-init, "
+                         "softcap, hourglass f0.3 d1152) instead of the "
+                         "plain gated one")
     args = ap.parse_args()
     if args.no_flex:
         from core import gated_swa
@@ -39,12 +44,30 @@ def main():
     torch.manual_seed(1234)
 
     B, T = args.micro_bs, args.seq_len
-    # COW layers need the band+chains budget split; G/S layers ignore it
-    band = 256 if "C" in args.pattern else 0
-    cfg = GPTConfig(attn_pattern=args.pattern, window=512, n_gates=8,
-                    recent_band=band, pos=args.pos,
-                    block_size=max(1024, args.seq_len))
+    if args.franken:
+        cfg = GPTConfig(attn_pattern=args.pattern, window=256, n_gates=4,
+                        recent_band=128, pos="rope", n_embd=1152,
+                        hg_frac=0.3, hg_bneck=8, hg_round=96,
+                        mlp="relu2", norm="rms", qk_norm=True,
+                        diff_attn=True, canon=True, softcap=15.0,
+                        untied=True, zero_init=True, bias=False,
+                        block_size=max(1024, args.seq_len))
+    else:
+        # COW layers need the band+chains budget split; G/S ignore it
+        band = 256 if "C" in args.pattern else 0
+        cfg = GPTConfig(attn_pattern=args.pattern, window=512, n_gates=8,
+                        recent_band=band, pos=args.pos,
+                        block_size=max(1024, args.seq_len))
     model = GPT(cfg).to(device).eval()
+    if args.franken:
+        # zero-init head/projections/canon would make the compiled-vs-eager
+        # diff vacuously 0 and leave those paths unexercised — randomize
+        # them for VALIDATION only (training keeps the real zero init)
+        with torch.no_grad():
+            torch.nn.init.normal_(model.lm_head.weight, std=0.02)
+            for name, p in model.named_parameters():
+                if name.endswith(("c_proj.weight", "conv.weight")):
+                    torch.nn.init.normal_(p, std=0.01)
     idx = torch.randint(0, cfg.vocab_size, (B, T), device=device)
 
     if args.compile_only:

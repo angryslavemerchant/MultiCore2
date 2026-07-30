@@ -80,6 +80,9 @@ def parse_args():
                     help="residual stream width, from hourglass_match.py; "
                          "overrides the scale's n_embd. Required with "
                          "--hg-frac")
+    ap.add_argument("--hg-round", type=int, default=24,
+                    help="width rounding; 96 keeps head_dim a multiple of "
+                         "8 (franken/flex), 24 matches the phase-3 arms")
     ap.add_argument("--lb-coef", type=float, default=0.01,
                     help="router load-balance aux weight (G/C layers; "
                          "the router measurably collapses at init without "
@@ -93,6 +96,22 @@ def parse_args():
                          "into the chain, below births a new one")
     ap.add_argument("--cow-chunk", type=int, default=128,
                     help="C layers: chain-scan chunk (heads frozen within)")
+    # Frankenstein stack (all default off; see core/model.py)
+    ap.add_argument("--norm", default="ln", choices=("ln", "rms"))
+    ap.add_argument("--qk-norm", action="store_true")
+    ap.add_argument("--diff-attn", action="store_true")
+    ap.add_argument("--canon", action="store_true")
+    ap.add_argument("--softcap", type=float, default=0.0)
+    ap.add_argument("--untied", action="store_true")
+    ap.add_argument("--zero-init", action="store_true",
+                    help="zero-init residual projections (speedrun) instead "
+                         "of GPT-2's 1/sqrt(2L) scaling")
+    ap.add_argument("--no-bias", action="store_true",
+                    help="drop every Linear/LayerNorm bias")
+    ap.add_argument("--opt", default="adamw", choices=("adamw", "muon"))
+    ap.add_argument("--muon-lr", type=float, default=0.02,
+                    help="Muon base lr for hidden matrices; --lr still "
+                         "drives the AdamW side and the schedule shape")
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--dropout", type=float, default=0.0)
     # stopping rule (first non-None wins, in this order)
@@ -208,8 +227,13 @@ def main():
                              if ("G" in args.attn_pattern
                                  or "C" in args.attn_pattern) else 0.0),
                     hg_frac=args.hg_frac, hg_bneck=args.hg_bneck,
-                    hg_mid=args.hg_mid, cow_chains=args.cow_chains,
+                    hg_mid=args.hg_mid, hg_round=args.hg_round,
+                    cow_chains=args.cow_chains,
                     cow_theta=args.cow_theta, cow_chunk=args.cow_chunk,
+                    norm=args.norm, qk_norm=args.qk_norm,
+                    diff_attn=args.diff_attn, canon=args.canon,
+                    softcap=args.softcap, untied=args.untied,
+                    zero_init=args.zero_init, bias=not args.no_bias,
                     **scale)
     model = GPT(cfg).to(device)
     n_params = model.num_params()
@@ -272,7 +296,8 @@ def main():
             model, device_ids=[local_rank])
 
     optimizer = raw_model.configure_optimizers(
-        args.weight_decay, args.lr, tuple(args.betas), device_type)
+        args.weight_decay, args.lr, tuple(args.betas), device_type,
+        opt=args.opt, muon_lr=args.muon_lr)
     if ckpt is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
     del ckpt
@@ -381,7 +406,7 @@ def main():
     for step in range(start_step, iters):
         lr = lr_at(step)
         for g in optimizer.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * g.get("lr_scale", 1.0)
 
         optimizer.zero_grad(set_to_none=True)
         loss_acc = 0.0

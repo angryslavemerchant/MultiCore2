@@ -42,6 +42,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from core.diffattn import DiffMixin, rms
+
 USE_FLEX = True     # module-level override for tests / debugging
 
 try:
@@ -117,24 +119,37 @@ if _HAVE_FLEX:
 _STATIC_MASK_CACHE = {}
 
 
-def _attend(q, k, v, death, dropout_p, cache_key=None):
-    """Dispatch to flex_attention (skips dead blocks) or dense-mask SDPA."""
-    B, H, T, _ = q.shape
-    if USE_FLEX and _HAVE_FLEX and q.is_cuda:
+def _prepare_attend(death, B, T, device, cache_key=None):
+    """Resolve the mask ONCE and return a closure applying attention under
+    it. Differential attention runs two passes per layer over the same
+    mask — for gated layers the mask is data-dependent (a BlockMask built
+    outside the compiled graph), so building it once per forward matters.
+    flex_attention supports value head_dim != qk head_dim, which the diff
+    passes rely on (2*hd shared pair values)."""
+    if USE_FLEX and _HAVE_FLEX and device.type == "cuda":
         if cache_key is not None:
-            key = (B, T, cache_key, str(q.device))
+            key = (B, T, cache_key, str(device))
             block_mask = _STATIC_MASK_CACHE.get(key)
             if block_mask is None:
-                block_mask = _build_block_mask(death, B, T, q.device)
+                block_mask = _build_block_mask(death, B, T, device)
                 _STATIC_MASK_CACHE[key] = block_mask
         else:
-            block_mask = _build_block_mask(death, B, T, q.device)
-        return flex_attention(q, k, v, block_mask=block_mask)
-    return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=interval_mask(death, T), dropout_p=dropout_p)
+            block_mask = _build_block_mask(death, B, T, device)
+        return lambda q, k, v, dropout_p=0.0: flex_attention(
+            q, k, v, block_mask=block_mask)
+    mask = interval_mask(death, T)
+    return lambda q, k, v, dropout_p=0.0: F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, dropout_p=dropout_p)
 
 
-class SlidingWindowAttention(nn.Module):
+def _attend(q, k, v, death, dropout_p, cache_key=None):
+    """Dispatch to flex_attention (skips dead blocks) or dense-mask SDPA."""
+    B, _, T, _ = q.shape
+    return _prepare_attend(death, B, T, q.device, cache_key)(q, k, v,
+                                                             dropout_p)
+
+
+class SlidingWindowAttention(DiffMixin, nn.Module):
     """Causal attention over the last `cfg.window` tokens (the control arm)."""
 
     def __init__(self, cfg):
@@ -144,10 +159,12 @@ class SlidingWindowAttention(nn.Module):
         self.window = cfg.window
         self.dropout = cfg.dropout
         self.use_rope = cfg.pos == "rope"
+        self.qk_norm = cfg.qk_norm
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
         self.resid_dropout = nn.Dropout(cfg.dropout)
+        self._init_diff(cfg)
 
     def _death(self, x):
         B, T, _ = x.shape
@@ -160,17 +177,27 @@ class SlidingWindowAttention(nn.Module):
         q = q.view(shp).transpose(1, 2)
         k = k.view(shp).transpose(1, 2)
         v = v.view(shp).transpose(1, 2)
+        if self.qk_norm:
+            q, k = rms(q), rms(k)
         if self.use_rope:
             from core.rope import apply_rope
             q, k = apply_rope(q, k)
         return q, k, v
 
+    def _run_attn(self, q, k, v, death, dropout_p, cache_key=None):
+        """One (or, diff, two) attention pass(es) over a single mask."""
+        B, T = q.shape[0], q.shape[2]
+        attend = _prepare_attend(death, B, T, q.device, cache_key)
+        if self.diff:
+            return self._diff_attend(attend, q, k, v, dropout_p)
+        return attend(q, k, v, dropout_p)
+
     def forward(self, x):
         B, T, C = x.shape
         q, k, v = self._qkv(x)
-        y = _attend(q, k, v, self._death(x),
-                    self.dropout if self.training else 0.0,
-                    cache_key=("swa", self.window))
+        y = self._run_attn(q, k, v, self._death(x),
+                           self.dropout if self.training else 0.0,
+                           cache_key=("swa", self.window))
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
 
@@ -225,8 +252,8 @@ class GatedSWAttention(SlidingWindowAttention):
             # jagged sliding window and no kernel structure changes.
             death = torch.maximum(
                 death, torch.arange(T, device=x.device) + self.recent_band)
-        y = _attend(q, k, v, death,
-                    self.dropout if self.training else 0.0)
+        y = self._run_attn(q, k, v, death,
+                           self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         if self.collect_stats:
