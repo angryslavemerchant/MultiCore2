@@ -295,12 +295,14 @@ def main():
         os.environ.setdefault("FLEX_BLOCK_N", "32")
         os.environ.setdefault("FLEX_NUM_STAGES", "2")
     if compile_ok:
-        if args.diff_attn and ddp:
+        if ddp and (args.diff_attn
+                    or any(c in args.attn_pattern for c in "GSC")):
             # DDPOptimizer's graph-splitting chokes on flex_attention's
-            # higher-order op when diff attention is on ("'int' object has
-            # no attribute 'meta'", bisected 2026-07-30: single-process
-            # trains, any DDP rank count crashes). Compile the whole graph
-            # instead; DDP still overlaps at graph boundaries.
+            # higher-order op inside the franken graph shape ("'int'
+            # object has no attribute 'meta'", 2026-07-30: single-process
+            # trains, DDP crashes — with or without diff attention or
+            # flex kernel_options). Compile the whole graph instead;
+            # costs the backward/allreduce overlap (~few % at 124M).
             torch._dynamo.config.optimize_ddp = False
         model = torch.compile(model)
     raw_model = model._orig_mod if compile_ok else model
