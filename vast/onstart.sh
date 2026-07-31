@@ -63,6 +63,12 @@ fi
 # --- Full provisioning -----------------------------------------------------
 echo "INSTALLING_DEPS"
 "$PY" -m pip install -q -r requirements.txt
+# Banded flash kernels for windowed layers (core/gated_swa._resolve_flash;
+# 1.6x over flex on the pyramid). --no-deps is load-bearing: the xformers
+# wheel pins its own torch. cudart12 shim required — the wheel is
+# cu128-built and torch auto-loads libcudart.so.12 from pip nvidia pkgs.
+"$PY" -m pip install -q --no-deps xformers
+"$PY" -m pip install -q nvidia-cuda-runtime-cu12
 
 # --- Health gate: refuse to train on a sick machine -------------------------
 # KEEP_ALIVE (smoke tests) preserves the instance so the failing metrics
