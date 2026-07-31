@@ -427,7 +427,8 @@ def hedged_launch(args, secrets, gpu, max_dph):
                                   keep_alive=args.keep_alive,
                                   purpose="train",
                                   train_script=args.train_script,
-                                  thresholds=args.thresholds)
+                                  thresholds=args.thresholds,
+                                  nproc=getattr(args, "nproc", None))
             racers[iid] = o
             all_created.add(iid)
             print(f"  racer {iid} on m{o.get('machine_id')} "
