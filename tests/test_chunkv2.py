@@ -136,15 +136,17 @@ def test_topk_required():
 
 # ------------------------------------------------------------- accounting
 
-def test_flops_ordering_and_fetch_monotone():
+def test_flops_ordering_and_fetch_accounting():
     T = 256
     fN = GPT(tiny()).flops_per_token(T)
     fK = GPT(tiny(attn_pattern="K", chunk_topk=8)).flops_per_token(T)
     fS = GPT(tiny(attn_pattern="S")).flops_per_token(T)
     assert fN > fK > fS          # recursion + fetch + dedup cost extra
+    # dense-with-mask fetch: compute depends on the log size, not
+    # fetch_n -- n only shapes the mask (on/off is the real knob)
     f0 = GPT(tiny(chunk_fetch_n=0)).flops_per_token(T)
     f8 = GPT(tiny(chunk_fetch_n=8)).flops_per_token(T)
-    assert f8 > fN > f0
+    assert f8 == fN > f0
 
 
 def test_hourglass_slice_widths():

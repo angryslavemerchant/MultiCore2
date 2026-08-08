@@ -146,9 +146,19 @@ class ChunkV2Attention(ChunkAttention):
 
     def _fetch(self, q, k_n, v, s_c, ptr, ok):
         """Raw member fetch: top fetch_n chunks per query by log score,
-        attend the union of their raw pointers. Returns
-        (s_f, vf) = per-query fetch logits (B,H,T,n*kk) and gathered
-        values (B,H,T,n*kk,hd); s_f is -inf where invalid."""
+        attend their raw pointers. Returns (s_f, vf) = fetch logits
+        (B,H,T,S*kk), -inf outside the query's selection, and the
+        per-CHUNK member values (B,H,S*kk,hd) shared by all queries.
+
+        Dense-with-mask on purpose: the per-query sparse formulation
+        (gather each query's 64 members, scatter-add grads back) put
+        78% of the training step into one atomic scatter kernel --
+        every query fetches the same few popular chunks, so their
+        members' grad rows serialize (measured 868ms/iter, value-
+        dependent: appears only once training sharpens selection).
+        Scoring ALL chunks' members densely and masking non-selected
+        ones to -inf is the same math with GEMM gradients; members are
+        gathered once per chunk (S*kk rows, contention-free)."""
         B, H, T, S = s_c.shape
         hd = q.shape[-1]
         kk = self.topk
@@ -156,28 +166,18 @@ class ChunkV2Attention(ChunkAttention):
         fv, fi = s_c.topk(n, dim=-1)                      # (B,H,T,n)
         sel_ok = torch.isfinite(fv)                       # visible chunk
 
-        def take_chunkdim(t, last):   # (B,H,S,last) -> (B,H,T,n,last)
-            idxe = fi.reshape(B, H, T * n, 1).expand(B, H, T * n, last)
-            return t.gather(2, idxe).view(B, H, T, n, last)
-
-        pidx = take_chunkdim(ptr, kk)                     # (B,H,T,n,kk)
-        okf = take_chunkdim(ok, kk) & sel_ok.unsqueeze(-1)
-        pidx = pidx.reshape(B, H, T, n * kk)
-        okf = okf.reshape(B, H, T, n * kk)
-
-        def take_raw(t):    # (B,H,T,hd) -> (B,H,T,n*kk,hd)
-            # dim-2 gather: backward scatter-adds into (B,H,T,hd)
-            # instead of materialising a (B,H,T,T,hd) zeros source --
-            # that shape was a measured 21 GiB OOM at the w672 layer
-            idxe = pidx.reshape(B, H, T * n * kk, 1).expand(
-                B, H, T * n * kk, hd)
-            return t.gather(2, idxe).view(B, H, T, n * kk, hd)
-
-        kf = take_raw(k_n)
-        vf = take_raw(v)
-        s_f = (kf @ q.unsqueeze(-1)).squeeze(-1) * hd ** -0.5
-        s_f = s_f.masked_fill(~okf, float("-inf"))
-        return s_f, vf
+        pidx = ptr.reshape(B, H, S * kk, 1).expand(B, H, S * kk, hd)
+        mem_k = k_n.gather(2, pidx)                       # (B,H,S*kk,hd)
+        mem_v = v.gather(2, pidx)
+        s_f = (q @ mem_k.transpose(-2, -1)) * hd ** -0.5  # (B,H,T,S*kk)
+        # member visible iff its chunk is in this query's top-n AND the
+        # pointer is raw (chunk->chunk references are never fetched)
+        sel = torch.zeros(B, H, T, S, dtype=torch.bool, device=q.device)
+        sel.scatter_(3, fi, sel_ok)
+        okm = sel.unsqueeze(-1) & ok.reshape(B, H, 1, S, kk)
+        s_f = s_f.view(B, H, T, S, kk).masked_fill(
+            ~okm, float("-inf")).view(B, H, T, S * kk)
+        return s_f, mem_v
 
     def forward(self, x):
         B, T, C = x.shape
@@ -229,7 +229,7 @@ class ChunkV2Attention(ChunkAttention):
             if self.fetch_n:
                 lse_f = torch.logsumexp(s_f.float(), dim=-1)
                 A_f = torch.softmax(s_f, dim=-1).nan_to_num()
-                out_f = (A_f.unsqueeze(-2) @ vf).squeeze(-2)
+                out_f = A_f @ vf
                 m = torch.maximum(m, lse_f)
             wl = (lse_l.float() - m).exp()[..., None]
             wc = (lse_c - m).exp().nan_to_num()[..., None]
@@ -252,8 +252,7 @@ class ChunkV2Attention(ChunkAttention):
             A = F.dropout(A, dropout_p)
         y = A[..., :T] @ v + A[..., T:T + s_c.shape[-1]] @ cv
         if self.fetch_n:
-            A_f = A[..., T + s_c.shape[-1]:]
-            y = y + (A_f.unsqueeze(-2) @ vf).squeeze(-2)
+            y = y + A[..., T + s_c.shape[-1]:] @ vf
         y = y.transpose(1, 2).reshape(B, T, C)
         return self.resid_dropout(self.c_proj(y))
 
@@ -261,9 +260,10 @@ class ChunkV2Attention(ChunkAttention):
 def chunkv2_extra_keys(T, btok, k_slots, topk, fetch_n):
     """Per-token extra attention keys of a chunkv2 layer, for
     flops_per_token. Log reads as v0.1; writer additionally scores the
-    growing chunk log (recursion); fetch adds fetch_n*topk keys per
-    token wherever at least one chunk is visible; dedup's S^2 cosine
-    matrix amortises to ~S^2/(3T) key-equivalents."""
+    growing chunk log (recursion); the dense-with-mask fetch scores ALL
+    chunks' members (S*topk keys per token wherever a chunk is visible
+    -- fetch_n only shapes the mask, not the compute); dedup's S^2
+    cosine matrix amortises to ~S^2/(3T) key-equivalents."""
     nblk = max(T // btok - (1 if T % btok == 0 else 0), 0)
     if nblk <= 0:
         return 0.0
@@ -273,6 +273,7 @@ def chunkv2_extra_keys(T, btok, k_slots, topk, fetch_n):
     write = k_slots * sum((b + 1) * btok + b * k_slots
                           for b in range(nblk)) / T
     write += k_slots * nblk * btok / T                # PMA block pooling
-    fetch = fetch_n * topk * sum(1 for t in range(T) if t // btok >= 1) / T
+    fetch = ((S * topk if fetch_n else 0)
+             * sum(1 for t in range(T) if t // btok >= 1) / T)
     dedup = S * S / (3 * T)
     return read + write + fetch + dedup
