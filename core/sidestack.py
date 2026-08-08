@@ -9,24 +9,18 @@ down-projection needed), each scaled by a softmax weight renormalized over
 the survivors (the chunk_topk precedent -- selection indices themselves get
 no gradient, the NSA trade), tagged with head-identity and log-distance
 embeddings (v carries neither -- RoPE lives in q/k), pushed through one
-shared slice MLP, then a single bidirectional attention block over each
-head's (1+k)-item set -- the head's slices plus a per-head CLS seed from
-the query token's own state (the query joins the set, so the deleted
-MLP's per-token transform happens inside the branch). Sets are PER-HEAD
-so SDPA's heads dimension does the batching (the joint (1+H*k)-item
-variant cost ~10x on set-attention tile shapes alone, JP profile
-2026-08-08); cross-head mixing happens in the read-out instead: the H
-CLS items concat back to token dim and go through a 4x MLP (hidden =
-4*d, the standard rule in TOKEN units) onto the residual in the MLP's
-old slot -- the same place c_proj mixes heads in regular attention.
+shared slice MLP, then a single bidirectional attention block over all
+H*k slices plus a CLS seed projected from the query token's own state (the
+query joins the set, so the deleted MLP's per-token transform happens
+inside the branch). The CLS read-out returns to token dim through a 4x MLP
+(hidden = 4*d, the standard rule in TOKEN units) and lands on the residual
+in the MLP's old slot.
 
 Width discipline: everything between the v slices and the final MLP runs at
 head_dim. Per-slice return to token dim before the set attention would put
 ~1G MACs/position through it (~2x the rest of the model); at head_dim the
 whole branch is ~1% of model FLOPs. See topk-sidestack-spec.md.
 """
-import os
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -98,36 +92,22 @@ class SWASideAttention(gated_swa.SlidingWindowAttention):
 
 
 @torch.no_grad()
-def _select_topk(q, k, topk, window=None, chunk=None):
+def _select_topk(q, k, topk, window=None, chunk=1024):
     """Per-head top-k visible-key indices by attention score, (B,H,T,k)
     int64. window=None: causal prefix, streamed over KEY chunks so nothing
     T x T is ever materialised. window=W: last-W band (death(k) = k + W,
-    i.e. keys t-W+1..t), streamed over QUERY chunks against their band.
-    Scores stay in the matmul dtype (bf16 under autocast) -- topk only
-    needs ranks, and the fp32 upcast doubled the sweep's memory traffic
-    for nothing but tie-breaks (JP profile 2026-08-08).
-    SIDESTACK_SWEEP_FP32=1 restores fp32 scores: the validation gate sets
-    it so compiled and eager pick IDENTICAL sets (bf16 reduction-order
-    diffs flip near-tied picks between implementations -- benign for
-    training, but it breaks the gate's compiled==eager premise)."""
+    i.e. keys t-W+1..t), streamed over QUERY chunks against their band."""
     B, H, T, hd = q.shape
     scale = hd ** -0.5
-    fp32 = os.environ.get("SIDESTACK_SWEEP_FP32", "0") == "1"
-
-    def cast(sc):
-        return sc.float() if fp32 else sc
     t_idx = torch.arange(T, device=q.device)
     if window is not None:
-        # chunk 1024 computes a wastefully wide strip for small windows,
-        # but fewer/fatter kernels still beat tight strips at chunk 256
-        # (2x, bench 2026-08-08) -- launch overhead dominates band waste
-        chunk = chunk or 1024
         out = []
         kk = min(topk, T)
         for s in range(0, T, chunk):
             e = min(s + chunk, T)
             lo = max(0, s - window + 1)
-            sc = cast(q[:, :, s:e] @ k[:, :, lo:e].transpose(-2, -1)) * scale
+            sc = (q[:, :, s:e] @ k[:, :, lo:e].transpose(-2, -1)
+                  ).float() * scale
             tq = torch.arange(s, e, device=q.device).view(1, 1, -1, 1)
             tk = torch.arange(lo, e, device=q.device).view(1, 1, 1, -1)
             sc = sc.masked_fill((tk > tq) | (tk <= tq - window),
@@ -143,11 +123,10 @@ def _select_topk(q, k, topk, window=None, chunk=None):
                 idx = torch.cat((idx, pad), dim=-1)
             out.append(idx)
         return torch.cat(out, dim=2)
-    chunk = chunk or 1024
     best_val = best_idx = None
     for s in range(0, T, chunk):
         e = min(s + chunk, T)
-        sc = cast(q @ k[:, :, s:e].transpose(-2, -1)) * scale
+        sc = (q @ k[:, :, s:e].transpose(-2, -1)).float() * scale
         j = torch.arange(s, e, device=q.device)
         sc = sc.masked_fill(j[None, None, None, :] > t_idx[None, None, :, None],
                             float("-inf"))
@@ -194,22 +173,15 @@ class SideStack(nn.Module):
         self.head_emb = nn.Parameter(torch.randn(H, 1, hd) * 0.02)
         self.dist_emb = nn.Parameter(
             torch.randn(N_DIST_BUCKETS, 1, hd) * 0.02)
-        # per-head seeds: one hd-slice of the projected query state per
-        # head (2026-08-08 speed redesign: sets are PER-HEAD, 1+k items,
-        # so SDPA's heads dimension does the batching -- the joint
-        # (1+H*k)-item set ran at ~10x the score cost for tile-shape
-        # reasons; cross-head mixing now happens in the read-out concat +
-        # final MLP, exactly like c_proj does for regular attention)
-        self.cls_proj = nn.Linear(C, C, bias=cfg.bias)
+        self.cls_proj = nn.Linear(C, hd, bias=cfg.bias)
         self.smlp = SliceMLP(cfg, hd)
         self.ln_set = make_norm(cfg, hd)
         self.wqkv = nn.Linear(hd, 3 * hd, bias=cfg.bias)
         self.wo = nn.Linear(hd, hd, bias=cfg.bias)
         self.ln_out = make_norm(cfg, hd)
-        # final MLP: 4x rule in TOKEN units on the concatenated per-head
-        # read-outs (C -> 4C -> C); c_proj naming => zero-init => the
-        # branch is a strict no-op at init
-        self.c_fc = nn.Linear(C, 4 * C, bias=cfg.bias)
+        # final MLP: 4x rule in TOKEN units (hd -> 4C -> C); c_proj naming
+        # => zero-init => the branch is a strict no-op at init
+        self.c_fc = nn.Linear(hd, 4 * C, bias=cfg.bias)
         self.c_proj = nn.Linear(4 * C, C, bias=cfg.bias)
         self.c_proj.RESIDUAL_SCALE_INIT = True
 
@@ -244,22 +216,17 @@ class SideStack(nn.Module):
                + self.dist_emb[bucket].squeeze(-2))
         slices = (w.unsqueeze(-1) * v_sel
                   + valid.unsqueeze(-1).to(emb.dtype) * emb)  # (B,H,T,kk,hd)
-        items = slices.permute(0, 2, 1, 3, 4)                 # (B,T,H,kk,hd)
+        items = slices.permute(0, 2, 1, 3, 4).reshape(B, T, H * kk, hd)
         items = self.smlp(items)
-        seed = self.cls_proj(x).view(B, T, H, 1, hd)
-        seq = torch.cat((seed, items), dim=3)                 # (B,T,H,N,hd)
-        N = seq.shape[3]
-        qkv = self.wqkv(self.ln_set(seq)).view(B, T, H, N, 3, hd)
-        sq, sk, sv = qkv.unbind(dim=4)                        # (B,T,H,N,hd)
-        # explicit bmm+softmax: at 17x17 the score matrices are tiny and
-        # every fused attention kernel loses to two batched GEMMs
-        # (perhead_bmm 2-3ms vs sdpa 8-9ms/layer, bench 2026-08-08)
-        sc = (sq @ sk.transpose(-2, -1)) * hd ** -0.5         # (B,T,H,N,N)
-        y = torch.softmax(sc, dim=-1) @ sv                    # bidirectional
-        seq = seq + self.wo(y)
-        cls = self.ln_out(seq[:, :, :, 0])                    # (B,T,H,hd)
-        return self.c_proj(
-            F.relu(self.c_fc(cls.reshape(B, T, H * hd))).square())
+        seq = torch.cat((self.cls_proj(x).unsqueeze(2), items),
+                        dim=2)                                # (B,T,N,hd)
+        N = seq.shape[2]
+        qkv = self.wqkv(self.ln_set(seq)).view(B * T, N, 3, hd)
+        sq, sk, sv = (qkv[:, :, i].unsqueeze(1) for i in range(3))
+        y = F.scaled_dot_product_attention(sq, sk, sv)        # bidirectional
+        seq = seq + self.wo(y.squeeze(1).view(B, T, N, hd))
+        cls = self.ln_out(seq[:, :, 0])
+        return self.c_proj(F.relu(self.c_fc(cls)).square())
 
 
 class TopKSideBlock(nn.Module):
@@ -308,9 +275,9 @@ def side_extra_flops(cfg, w, T, window=None):
     H = cfg.n_head
     hd = w // H
     kk = min(cfg.side_topk, T)
-    n = 1 + kk                       # per-head set length
+    n_items = 1 + H * kk
     sel = w * (T if window is None else 2 * window)
     slice_mlp = 6 * 8 * hd * hd * (H * kk - 1)
-    set_proj = 6 * 4 * hd * hd * (H * n - 1)
-    set_scores = 12 * hd * H * n * n
+    set_proj = 6 * 4 * hd * hd * (n_items - 1)
+    set_scores = 12 * hd * n_items * n_items
     return sel + slice_mlp + set_proj + set_scores
