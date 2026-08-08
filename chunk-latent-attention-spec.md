@@ -369,3 +369,18 @@ Final gate numbers: parity fwd+bwd exact; compiled-vs-eager logits
 0.0625, grads bf16 trunk 0.99853 / selection 0.97928 (tie-flips), fp32
 no-flex leg 0.999944; bench 335.9ms vs 126.7 window-only = **2.65x**
 (24.4k tok/s/GPU mb2, peak 20.1GB) — the honest fully-sequential tax.
+
+### 13.2 Static-shape mint (user: "can compile not unroll it?") — 1.71x
+
+Yes. The mint loop's dynamic shapes (growing prefix, growing log) were
+why it hid behind compiler.disable and ran eager. Rewrite: every
+boundary scores the FULL (T+S)-wide padded candidate set with -inf
+masks and writes into a preallocated log via differentiable
+index_copy — every iteration shape-identical, so torch.compile unrolls
+all 31 into fused kernels. Verified bit-identical (0.0 max diff) to
+the dynamic version. Gotchas: mask AFTER the gain multiply (else the
+gain grad sees 0·-inf = NaN); cast log writes to k/v dtype (rms
+upcasts under autocast, index_copy is dtype-strict).
+**Final: 217.0ms/iter vs 126.8 window-only = 1.71x** (37.7k tok/s/GPU
+mb2, peak 17.1GB — down from 2.65x/20GB). Full speed history:
+9.5x (atomic scatter) → 2.65x (dense fetch) → 1.71x (compiled mint).
