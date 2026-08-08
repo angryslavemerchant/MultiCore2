@@ -93,6 +93,12 @@ class GPTConfig:
     # each query keeps its chunk_topk best prefix tokens, softmax
     # renormalized over the survivors (v0.1, NSA-selection-style).
     chunk_topk: int = 0
+    # Chunk v0.2 (attn="chunkv2" / pattern N, core/chunkv2.py): recursive
+    # minting (writer candidates include older chunks, latent-only refs),
+    # soft dedup (per-head lam, init 0), and raw member fetch -- each
+    # query attends the raw-token pointers of its top chunk_fetch_n
+    # chunks as a third softmax branch. 0 disables the fetch branch.
+    chunk_fetch_n: int = 4
     # Top-k side-stack (pattern letter T, core/sidestack.py): full causal
     # attention whose MLP slot is replaced by a small transformer over the
     # per-head top-k retrieved v slices. This is the per-head k.
@@ -143,8 +149,8 @@ class GPTConfig:
             f"{len(self.attn_pattern)} chars for "
             f"{self.n_layer_total()} layers")
         key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow",
-               "K": "chunk", "B": "blocksum", "T": "topkside",
-               "R": "swaside"}
+               "K": "chunk", "B": "blocksum", "N": "chunkv2",
+               "T": "topkside", "R": "swaside"}
         return [key[c] for c in self.attn_pattern]
 
     def layer_windows(self):
@@ -327,6 +333,7 @@ class SliceBlock(nn.Module):
 from core.gated_swa import SlidingWindowAttention, GatedSWAttention  # noqa: E402
 from core.cow import COWAttention  # noqa: E402
 from core.chunk import ChunkAttention, BlockSumAttention  # noqa: E402
+from core.chunkv2 import ChunkV2Attention  # noqa: E402
 
 # The seams. The new architecture adds entries here; the config selects them.
 ATTENTIONS = {"causal": CausalSelfAttention,
@@ -334,7 +341,8 @@ ATTENTIONS = {"causal": CausalSelfAttention,
               "gated": GatedSWAttention,
               "cow": COWAttention,
               "chunk": ChunkAttention,
-              "blocksum": BlockSumAttention}
+              "blocksum": BlockSumAttention,
+              "chunkv2": ChunkV2Attention}
 MLPS = {"gelu": GeluMLP, "relu2": Relu2MLP}
 BLOCKS = {"gpt2": Block}
 
@@ -474,10 +482,14 @@ class GPT(nn.Module):
         # chunk layers: local band + log reads + (free arm) writer
         # cross-attention, all counted as extra visible keys per token
         from core.chunk import chunk_extra_keys
+        from core.chunkv2 import chunkv2_extra_keys
         chunk_keys = {
             key: chunk_extra_keys(T, self.cfg.chunk_btok,
                                   self.cfg.chunk_k, free)
             for key, free in (("chunk", True), ("blocksum", False))}
+        chunk_keys["chunkv2"] = chunkv2_extra_keys(
+            T, self.cfg.chunk_btok, self.cfg.chunk_k,
+            self.cfg.chunk_topk, self.cfg.chunk_fetch_n)
         # hourglass layers score at their own (narrower) width; windowed
         # layers at their own (per-layer, cfg.windows) window
         score = sum(12 * w * (T if win is None

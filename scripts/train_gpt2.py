@@ -106,6 +106,9 @@ def parse_args():
     ap.add_argument("--chunk-topk", type=int, default=0,
                     help="chunk layers: hard top-k membership per query "
                          "(0 = soft mixture over the whole prefix)")
+    ap.add_argument("--chunk-fetch-n", type=int, default=4,
+                    help="N layers (chunk v0.2): raw-fetch the pointer "
+                         "sets of each query's top-n chunks (0 disables)")
     ap.add_argument("--side-topk", type=int, default=16,
                     help="T layers (top-k side-stack): per-head k slices "
                          "fed to the branch in the MLP slot")
@@ -202,6 +205,9 @@ def parse_args():
                              + (f"-ck{args.chunk_k}b{args.chunk_btok}"
                                 if ("K" in args.attn_pattern
                                     or "B" in args.attn_pattern) else "")
+                             + (f"-nk{args.chunk_k}b{args.chunk_btok}"
+                                f"t{args.chunk_topk}f{args.chunk_fetch_n}"
+                                if "N" in args.attn_pattern else "")
                              + (f"-st{args.side_topk}"
                                 if ("T" in args.attn_pattern
                                     or "R" in args.attn_pattern) else ""))
@@ -257,6 +263,7 @@ def main():
                     cow_theta=args.cow_theta, cow_chunk=args.cow_chunk,
                     chunk_btok=args.chunk_btok, chunk_k=args.chunk_k,
                     chunk_topk=args.chunk_topk,
+                    chunk_fetch_n=args.chunk_fetch_n,
                     side_topk=args.side_topk,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
@@ -341,12 +348,12 @@ def main():
         # never covers them, and DDPOptimizer chokes on flex ("'int'
         # object has no attribute 'meta'", reconfirmed 8x 2026-08-08)
         flash_covers = (_gsw.USE_FLASH and not args.diff_attn
-                        and not any(c in args.attn_pattern for c in "GCKB")
+                        and not any(c in args.attn_pattern for c in "GCKBN")
                         and torch.cuda.is_available()
                         and _gsw._resolve_flash() is not None)
         if ddp and not flash_covers and (
                 args.diff_attn
-                or any(c in args.attn_pattern for c in "GSCKB")):
+                or any(c in args.attn_pattern for c in "GSCKBN")):
             # DDPOptimizer's graph-splitting chokes on flex_attention's
             # higher-order op inside the franken graph shape ("'int'
             # object has no attribute 'meta'", 2026-07-30: single-process

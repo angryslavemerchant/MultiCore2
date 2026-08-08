@@ -312,3 +312,41 @@ redesign. Changes, user-directed:
   fed by a late layer) — token-causal but not compute-causal; early
   layers can't read late-sourced chunks in one parallel pass. Revisit
   only as late-read-only (chunks visible to layers >= writer source).
+
+---
+
+## 13. v0.2 (2026-08-08) — recursion + dedup + raw fetch (pattern N)
+
+Built after the full v0/v0.1 capability bench (2026-08-08): chunk log =
+huge distance-flat gist memory, but ZERO exact fetch beyond the window,
+weak update-tracking (append-only keeps stale values live), and the
+verdict that capability is mechanism-intrinsic. v0.2 changes the
+mechanism on all three axes; `core/chunkv2.py`, pattern letter **N**
+(K stays v0.1, checkpoints keep loading).
+
+- **Recursive minting, fully sequential** (user: no wavefront/lag
+  affordances — stay true to the idea). Boundary b's writer candidates
+  = raw prefix UNION all previously minted chunks. Chunk→chunk
+  references fold in the LATENT only, never transitively expanded.
+  Mint loop runs eagerly under `torch.compiler.disable`; the
+  sequential tax (est. 1.15–2x) is measured by the gate before any run.
+- **Soft dedup** (read-side): per-head learned λ, init 0 = exact
+  append-only v0.1; each chunk's read logit penalized by
+  λ·relu(max cos sim to any NEWER chunk). Newest-wins ≈ the cheap COW
+  merge, which won update-margin.
+- **Raw member fetch** (NSA fine branch; the bench showed pointers
+  select right while summaries smear): each query attends the raw
+  pointer sets of its top `chunk_fetch_n` chunks as a THIRD branch of
+  the joint softmax (3-way LSE merge), position-free. Chunk-pointers
+  are never fetched — summary-of-summary content stays gist.
+- **Run shape** (settled): `SSSNNNNNNSSS` d1152 hourglass = cheapest-6
+  layers exactly (widths 672/576/480/384/384/480; 6th place is a
+  4-vs-10 tie at 672, kept at 4 for v0.1 comparability). Uniform
+  **w=128** everywhere (MiMo-proven; pays for the fetch keys and
+  pushes more gradient through the chunk path). btok=128, K=4,
+  topk=16, fetch_n=4. 150.70M params, 0.9242 GFLOPs/tok — cheaper
+  than the mimo control (142.99M, 0.9762) and ~level with v0.1's arm.
+- Gate `scripts/validate_chunkv2.py`: fast-vs-reference parity FWD+BWD,
+  compiled-vs-eager logits AND per-param grad cosines (flat-loss
+  lesson), zero-init projections randomized first, sequential-mint
+  wall-clock vs window-only control.
