@@ -55,6 +55,13 @@ def main():
                          "0.995 bf16)")
     args = ap.parse_args()
     thresh = args.cos_thresh or (0.9999 if args.fp32 else 0.995)
+    if args.fp32:
+        # fp32 can't use xformers (bf16-only) and fp32 flex tiles blow the
+        # 5090's shared-memory limit -- force the dense-mask SDPA fallback.
+        # The branch's compiled backward (the thing under test) is
+        # unaffected; the bf16 leg covers the real-run kernels.
+        from core import gated_swa
+        gated_swa.USE_FLEX = False
     torch.manual_seed(1337)
     for attr in ("recompile_limit", "cache_size_limit"):
         if hasattr(torch._dynamo.config, attr):
