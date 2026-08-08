@@ -83,6 +83,12 @@ class GPTConfig:
     cow_chains: int = 32       # K live chains per gate
     cow_theta: float = 0.7     # vigilance: best cosine >= theta -> merge
     cow_chunk: int = 128       # chain-scan chunk (heads frozen within)
+    # Chunk-latent attention (attn="chunk" / pattern K; control arm
+    # "blocksum" / pattern B): every chunk_btok tokens each layer mints
+    # chunk_k latent KVs over its own cache -- the only long-range path
+    # (raw attention stays windowed at cfg.window). core/chunk.py.
+    chunk_btok: int = 256      # write cadence (boundary every B_tok)
+    chunk_k: int = 16          # chunks minted per boundary
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
@@ -128,7 +134,8 @@ class GPTConfig:
             f"attn_pattern {self.attn_pattern!r} has "
             f"{len(self.attn_pattern)} chars for "
             f"{self.n_layer_total()} layers")
-        key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow"}
+        key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow",
+               "K": "chunk", "B": "blocksum"}
         return [key[c] for c in self.attn_pattern]
 
     def layer_windows(self):
@@ -309,12 +316,15 @@ class SliceBlock(nn.Module):
 
 from core.gated_swa import SlidingWindowAttention, GatedSWAttention  # noqa: E402
 from core.cow import COWAttention  # noqa: E402
+from core.chunk import ChunkAttention, BlockSumAttention  # noqa: E402
 
 # The seams. The new architecture adds entries here; the config selects them.
 ATTENTIONS = {"causal": CausalSelfAttention,
               "swa": SlidingWindowAttention,
               "gated": GatedSWAttention,
-              "cow": COWAttention}
+              "cow": COWAttention,
+              "chunk": ChunkAttention,
+              "blocksum": BlockSumAttention}
 MLPS = {"gelu": GeluMLP, "relu2": Relu2MLP}
 BLOCKS = {"gpt2": Block}
 
@@ -440,11 +450,18 @@ class GPT(nn.Module):
         # as two populations because both saturate independently.
         cow_keys = (avg_keys(self.cfg.recent_band)
                     + avg_keys(self.cfg.n_gates * self.cfg.cow_chains))
+        # chunk layers: local band + log reads + (free arm) writer
+        # cross-attention, all counted as extra visible keys per token
+        from core.chunk import chunk_extra_keys
+        chunk_keys = {
+            key: chunk_extra_keys(T, self.cfg.chunk_btok,
+                                  self.cfg.chunk_k, free)
+            for key, free in (("chunk", True), ("blocksum", False))}
         # hourglass layers score at their own (narrower) width; windowed
         # layers at their own (per-layer, cfg.windows) window
         score = sum(12 * w * (T if win is None
                               else cow_keys if k == "cow"
-                              else avg_keys(win))
+                              else avg_keys(win) + chunk_keys.get(k, 0.0))
                     for k, w, win in zip(self.cfg.layer_attns(),
                                          self.cfg.layer_widths(),
                                          self.cfg.layer_windows()))

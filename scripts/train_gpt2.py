@@ -99,6 +99,10 @@ def parse_args():
     ap.add_argument("--cow-theta", type=float, default=0.7,
                     help="C layers: vigilance; best cosine >= theta merges "
                          "into the chain, below births a new one")
+    ap.add_argument("--chunk-btok", type=int, default=256,
+                    help="chunk layers (pattern K/B): write cadence")
+    ap.add_argument("--chunk-k", type=int, default=16,
+                    help="chunk layers: chunks minted per boundary")
     ap.add_argument("--cow-chunk", type=int, default=128,
                     help="C layers: chain-scan chunk (heads frozen within)")
     # Frankenstein stack (all default off; see core/model.py)
@@ -188,7 +192,10 @@ def parse_args():
                                 f"-th{args.cow_theta}"
                                 if "C" in args.attn_pattern else "")
                              + (f"-r{args.recent_band}"
-                                if args.recent_band else ""))
+                                if args.recent_band else "")
+                             + (f"-ck{args.chunk_k}b{args.chunk_btok}"
+                                if ("K" in args.attn_pattern
+                                    or "B" in args.attn_pattern) else ""))
         else:
             args.run_name = f"{args.scale}-{args.block}-{args.attn}-{args.mlp}"
         if args.pos == "rope":
@@ -239,6 +246,7 @@ def main():
                     hg_mid=args.hg_mid, hg_round=args.hg_round,
                     cow_chains=args.cow_chains,
                     cow_theta=args.cow_theta, cow_chunk=args.cow_chunk,
+                    chunk_btok=args.chunk_btok, chunk_k=args.chunk_k,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,
