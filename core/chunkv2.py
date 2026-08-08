@@ -103,9 +103,12 @@ class ChunkV2Attention(ChunkAttention):
             cand_v = torch.cat([v[:, :, :p]] + cvs, dim=2)
 
             def take(t):   # (B,H,N,hd) -> selected (B,H,K,kk,hd)
-                src = t.unsqueeze(2).expand(B, H, K, t.shape[2], hd)
-                return src.gather(3, idx.unsqueeze(-1).expand(
-                    B, H, K, kk, hd))
+                # gather along the candidate dim: backward is a
+                # scatter-add into t, NOT a zeros_like of an expanded
+                # (B,H,K,N,hd) source (the OOM shape)
+                idxe = idx.reshape(B, H, K * kk, 1).expand(
+                    B, H, K * kk, hd)
+                return t.gather(2, idxe).view(B, H, K, kk, hd)
 
             ck_raw = (A.unsqueeze(-1) * take(cand_k)).sum(3)
             cv_raw = (A.unsqueeze(-1) * take(cand_v)).sum(3)
@@ -154,8 +157,8 @@ class ChunkV2Attention(ChunkAttention):
         sel_ok = torch.isfinite(fv)                       # visible chunk
 
         def take_chunkdim(t, last):   # (B,H,S,last) -> (B,H,T,n,last)
-            src = t.unsqueeze(2).expand(B, H, T, S, last)
-            return src.gather(3, fi.unsqueeze(-1).expand(B, H, T, n, last))
+            idxe = fi.reshape(B, H, T * n, 1).expand(B, H, T * n, last)
+            return t.gather(2, idxe).view(B, H, T, n, last)
 
         pidx = take_chunkdim(ptr, kk)                     # (B,H,T,n,kk)
         okf = take_chunkdim(ok, kk) & sel_ok.unsqueeze(-1)
@@ -163,9 +166,12 @@ class ChunkV2Attention(ChunkAttention):
         okf = okf.reshape(B, H, T, n * kk)
 
         def take_raw(t):    # (B,H,T,hd) -> (B,H,T,n*kk,hd)
-            src = t.unsqueeze(2).expand(B, H, T, T, hd)
-            return src.gather(3, pidx.unsqueeze(-1).expand(
-                B, H, T, n * kk, hd))
+            # dim-2 gather: backward scatter-adds into (B,H,T,hd)
+            # instead of materialising a (B,H,T,T,hd) zeros source --
+            # that shape was a measured 21 GiB OOM at the w672 layer
+            idxe = pidx.reshape(B, H, T * n * kk, 1).expand(
+                B, H, T * n * kk, hd)
+            return t.gather(2, idxe).view(B, H, T, n * kk, hd)
 
         kf = take_raw(k_n)
         vf = take_raw(v)
