@@ -350,3 +350,22 @@ mechanism on all three axes; `core/chunkv2.py`, pattern letter **N**
   compiled-vs-eager logits AND per-param grad cosines (flat-loss
   lesson), zero-init projections randomized first, sequential-mint
   wall-clock vs window-only control.
+
+### 13.1 Gate saga addendum (2026-08-08, 1x5090)
+
+Two kernel-shape lessons, both caught by the gate before any run:
+1. **Gather-on-expanded-view backward materialises the source**: the
+   fetch's per-query gather from a (B,H,T,T,hd) expand OOM'd at 21 GiB
+   — gather along the sequence dim instead (backward = scatter-add).
+2. **Per-query sparse fetch backward = atomic-scatter hotspot**: one
+   fused scatter_add kernel was 78% of the training step (868ms,
+   value-dependent — appears only once training sharpens selection and
+   every query fetches the same popular chunks; 9.5x wall-clock, and
+   invisible at init, so bench WITH optimizer steps). Fix: dense-with-
+   mask fetch — members gathered once per chunk (S·kk rows), all
+   scored per query, non-selected masked to -inf. Same math, GEMM
+   gradients. FLOPs now honest at 0.9906 G/tok (+1.5% vs mimo ctrl).
+Final gate numbers: parity fwd+bwd exact; compiled-vs-eager logits
+0.0625, grads bf16 trunk 0.99853 / selection 0.97928 (tie-flips), fp32
+no-flex leg 0.999944; bench 335.9ms vs 126.7 window-only = **2.65x**
+(24.4k tok/s/GPU mb2, peak 20.1GB) — the honest fully-sequential tax.
