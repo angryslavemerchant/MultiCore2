@@ -59,6 +59,12 @@ def main():
     with torch.no_grad():
         # the zero-init head blocks every trunk gradient at step 1
         model.lm_head.weight.normal_(0, 0.02)
+        # likewise the branch's zero-init output projection blocks every
+        # upstream branch gradient for exactly one step -- randomize so
+        # the aliveness check sees real backward traffic
+        for n, p in model.named_parameters():
+            if ".side." in n and n.endswith("c_proj.weight"):
+                p.normal_(0, 0.02)
 
     x = torch.randint(0, 50304, (1, args.seq), device="cuda")
     y = torch.randint(0, 50304, (1, args.seq), device="cuda")
