@@ -314,6 +314,14 @@ def main():
         os.environ.setdefault("FLEX_NUM_STAGES", "2")
     if compile_ok:
         from core import gated_swa as _gsw
+        # SliceBlock.forward specializes per hourglass width: 12 distinct
+        # widths blow the default limit (8) and later layers fall back to
+        # EAGER — harmless when attention is a flash kernel either way,
+        # fatal for chunk layers whose flex_attention then runs the slow
+        # fallback implementation (6.3x, bench box 2026-08-07).
+        for attr in ("recompile_limit", "cache_size_limit"):
+            if hasattr(torch._dynamo.config, attr):
+                setattr(torch._dynamo.config, attr, 64)
         # flash-attn covering every windowed layer removes flex from the
         # training graph entirely (S layers -> flash, F -> SDPA causal),
         # so DDPOptimizer's graph splitting is safe again and the

@@ -141,6 +141,11 @@ def main():
 
     assert torch.cuda.is_available()
     print(f"[validate_chunk] {torch.cuda.get_device_name(0)}", flush=True)
+    # mirror the trainer: 12 hourglass widths > default recompile limit,
+    # and eager-fallback flex is ~6x slow
+    for attr in ("recompile_limit", "cache_size_limit"):
+        if hasattr(torch._dynamo.config, attr):
+            setattr(torch._dynamo.config, attr, 64)
 
     # 1. fast path must be available (flex with return_lse)
     from core.gated_swa import _HAVE_FLEX
