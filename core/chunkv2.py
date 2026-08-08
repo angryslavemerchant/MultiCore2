@@ -66,15 +66,27 @@ class ChunkV2Attention(ChunkAttention):
         self.lam = nn.Parameter(torch.zeros(cfg.n_head))
 
     # ------------------------------------------------------------ writer
-    @torch.compiler.disable
     def _mint_recursive(self, x, k_n, k_r, v, nblk):
         """Sequential mint. Returns (ck, cv, ptr, ok): the log
         (B,H,S,hd), each chunk's member pointers (B,H,S,kk) as indices
-        into the raw sequence, and ok = pointer-is-raw (False marks a
-        chunk->chunk reference, which must never be fetched)."""
+        into cat(raw, log) candidate space, and ok = pointer-is-raw
+        (False marks a chunk->chunk reference, never fetched).
+
+        STATIC SHAPES on purpose: every boundary scores the FULL
+        (T + S)-wide candidate set with -inf masks over
+        not-yet-visible raw tokens / not-yet-minted chunks, and writes
+        into a preallocated log via (differentiable, out-of-place)
+        index_copy. Identical math to prefix-sliced scoring -- masked
+        softmax over -inf is the sliced softmax -- but every iteration
+        of the loop has the same shapes, so torch.compile unrolls the
+        31 iterations into fused kernels instead of the eager
+        Python-dispatch loop that a compiler.disable'd dynamic-shape
+        version was stuck with (58ms fwd/layer measured). The wasted
+        masked FLOPs are writer-score-sized, i.e. noise."""
         B, T, C = x.shape
         H, hd = self.n_head, C // self.n_head
         K, kk = self.k_slots, self.topk
+        S = nblk * K
         scale = hd ** -0.5
         qw = self._queries(x, nblk)                       # (B,H,S,hd)
         if self.qk_norm:
@@ -86,26 +98,31 @@ class ChunkV2Attention(ChunkAttention):
             qw_r = rope_at(qw, pos, nblk * self.btok)
         else:
             qw_r = qw
-        cks, cvs, ptrs, oks = [], [], [], []
+        tcol = torch.arange(T, device=x.device)           # raw col ids
+        scol = torch.arange(S, device=x.device)           # log slot ids
+        ck_log = k_n.new_zeros(B, H, S, hd)
+        cv_log = v.new_zeros(B, H, S, hd)
+        ptrs, oks = [], []
         for b in range(nblk):
-            p = (b + 1) * self.btok                # raw candidates
+            p = (b + 1) * self.btok                # visible raw prefix
             qr = qw_r[:, :, b * K:(b + 1) * K]     # (B,H,K,hd)
             qn = qw_n[:, :, b * K:(b + 1) * K]
-            s = (qr @ k_r[:, :, :p].transpose(-2, -1)) * scale
-            if b:
-                log_k = torch.cat(cks, dim=2)      # (B,H,b*K,hd)
-                s_chk = (qn @ log_k.transpose(-2, -1)) * scale
-                s = torch.cat((s, s_chk), dim=-1)
+            s_raw = (qr @ k_r.transpose(-2, -1)) * scale   # (B,H,K,T)
+            s_chk = (qn @ ck_log.transpose(-2, -1)) * scale  # (B,H,K,S)
+            s = torch.cat((s_raw, s_chk), dim=-1)
             s = s * self.gain.view(1, -1, 1, 1)
+            # mask AFTER the gain: gain * -inf backpropagates
+            # 0 * -inf = NaN into the gain grad
+            dead = torch.cat((tcol >= p, scol >= b * K))
+            s = s.masked_fill(dead, float("-inf"))
             val, idx = s.topk(kk, dim=-1)          # (B,H,K,kk)
             A = torch.softmax(val, dim=-1)
-            cand_k = torch.cat([k_n[:, :, :p]] + cks, dim=2)
-            cand_v = torch.cat([v[:, :, :p]] + cvs, dim=2)
+            cand_k = torch.cat((k_n, ck_log), dim=2)   # (B,H,T+S,hd)
+            cand_v = torch.cat((v, cv_log), dim=2)
 
-            def take(t):   # (B,H,N,hd) -> selected (B,H,K,kk,hd)
-                # gather along the candidate dim: backward is a
-                # scatter-add into t, NOT a zeros_like of an expanded
-                # (B,H,K,N,hd) source (the OOM shape)
+            def take(t):   # (B,H,T+S,hd) -> selected (B,H,K,kk,hd)
+                # dim-2 gather: backward is a scatter-add into t, NOT a
+                # zeros_like of an expanded (B,H,K,T+S,hd) source
                 idxe = idx.reshape(B, H, K * kk, 1).expand(
                     B, H, K * kk, hd)
                 return t.gather(2, idxe).view(B, H, K, kk, hd)
@@ -120,15 +137,14 @@ class ChunkV2Attention(ChunkAttention):
             cvb = h[..., 1, :].transpose(1, 2)
             if self.qk_norm:
                 ckb = rms(ckb)
-            cks.append(ckb)
-            cvs.append(cvb)
+            slots = scol[b * K:(b + 1) * K]
+            ck_log = ck_log.index_copy(2, slots, ckb)
+            cv_log = cv_log.index_copy(2, slots, cvb)
             ptrs.append(idx)
-            oks.append(idx < p)
-        ck = torch.cat(cks, dim=2)
-        cv = torch.cat(cvs, dim=2)
+            oks.append(idx < p)                     # raw iff < T & < p
         ptr = torch.cat(ptrs, dim=2).clamp(max=T - 1)     # refs masked by ok
         ok = torch.cat(oks, dim=2)
-        return ck, cv, ptr, ok
+        return ck_log, cv_log, ptr, ok
 
     # -------------------------------------------------------------- read
     def _dedup_penalty(self, ck):
