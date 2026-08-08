@@ -21,11 +21,17 @@ UNROTATED keys/values and read with unrotated queries).
 Two execution paths, equal to float tolerance:
   reference -- materialised concat logits, single softmax. Runs
     everywhere; O(T^2) memory, so tests/smoke only at scale.
-  fast      -- banded local branch via xformers
-    memory_efficient_attention_partial (returns out + LSE) merged with
-    an eager chunk branch by log-sum-exp; algebraically the same joint
-    softmax. Resolved lazily and numerics-probed on first CUDA call,
-    gated_swa-style. Kill switch: FLASH_CHUNK=0 / core.chunk.USE_FAST.
+  fast      -- banded local branch via flex_attention(return_lse=True)
+    under a cached static BlockMask (built eagerly, compiler.disable --
+    the flex-compile-mask lesson), merged with an eager chunk branch by
+    log-sum-exp; algebraically the same joint softmax, differentiable
+    end to end. Flex's 128-tile granularity is harmless here: every
+    chunk layer runs the uniform w=256 band, not the w=32 staircase
+    that made flex unusable for the pyramid. Kill switch:
+    FLASH_CHUNK=0 / core.chunk.USE_FAST.
+    (Dead end, do not retry: xformers memory_efficient_attention_partial
+    returns out+LSE but registers NO autograd formula -- inference-only,
+    found on the bench box 2026-08-07.)
 
 Control arm (`blocksum`, pattern letter B): identical machinery but
 membership is positional slicing -- chunk j of block b is the mean of
@@ -46,19 +52,19 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from core.diffattn import rms
-from core.gated_swa import SlidingWindowAttention
+from core.gated_swa import SlidingWindowAttention, _HAVE_FLEX
 
 USE_FAST = os.environ.get("FLASH_CHUNK", "1") != "0"
 
-_PARTIAL_FN = None      # resolved (fn, layout) or False = resolution failed
 _MASK_CACHE = {}        # (kind, T, ...) -> bool mask, built once
+_FLEX_MASK_CACHE = {}   # (T, window, device) -> static BlockMask
 
 
-def rope_at(x, pos):
-    """Rotate (B, H, N, hd) queries to arbitrary positions pos (N,)."""
+def rope_at(x, pos, T):
+    """Rotate (B, H, N, hd) queries to positions pos (N,); T is a static
+    python int bounding pos (passing it avoids a .item() graph break)."""
     from core.rope import _cos_sin
     hd = x.shape[-1]
-    T = int(pos.max().item()) + 1
     cos, sin = _cos_sin(T, hd, x.device, x.dtype)     # (1,1,T,hd/2)
     cos, sin = cos[..., pos, :], sin[..., pos, :]
     x1, x2 = x[..., 0::2], x[..., 1::2]
@@ -104,39 +110,27 @@ def _writer_mask(T, btok, nblk, k_slots, device):
     return m
 
 
-def _resolve_partial():
-    """xformers partial attention (out + LSE) for the banded local branch,
-    numerics-probed against an eager reference before being trusted."""
-    global _PARTIAL_FN
-    if _PARTIAL_FN is not None:
-        return _PARTIAL_FN or None
-    _PARTIAL_FN = False
-    try:
-        from xformers.ops import fmha
+def _swa_flex_mask(T, window, device):
+    """Static banded BlockMask, built EAGERLY and cached. Building a
+    BlockMask inside a compiled graph silently corrupts data-dependent
+    masks (measured on the gated arms, 2026-07-30); these are static per
+    (T, window), so build-once-outside is both safe and free."""
+    key = (T, window, str(device))
+    m = _FLEX_MASK_CACHE.get(key)
+    if m is None:
+        from torch.nn.attention.flex_attention import create_block_mask
 
-        def fn(q, k, v, window):
-            # xformers wants (B, T, H, hd)
-            bias = fmha.attn_bias.LocalAttentionFromBottomRightMask(
-                window_left=window - 1, window_right=0)
-            out, lse = fmha.memory_efficient_attention_partial(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                attn_bias=bias)
-            return out.transpose(1, 2), lse       # (B,H,T,hd), (B,H,T)
+        def mask_mod(b, h, qi, ki):
+            return (ki <= qi) & (qi - ki < window)
 
-        # probe: banded eager softmax must match (out, lse) to bf16 tol
-        B, H, T, hd, W = 1, 2, 64, 32, 8
-        q = torch.randn(B, H, T, hd, device="cuda", dtype=torch.bfloat16)
-        k, v = torch.randn_like(q), torch.randn_like(q)
-        out, lse = fn(q, k, v, W)
-        s = (q.float() @ k.float().transpose(-2, -1)) * hd ** -0.5
-        s = s.masked_fill(~_band_mask(T, W, q.device), float("-inf"))
-        ref = torch.softmax(s, -1) @ v.float()
-        assert (out.float() - ref).abs().max() < 3e-2
-        assert (lse.float() - torch.logsumexp(s, -1)).abs().max() < 3e-2
-        _PARTIAL_FN = fn
-    except Exception:
-        _PARTIAL_FN = False
-    return _PARTIAL_FN or None
+        m = create_block_mask(mask_mod, None, None, T, T,
+                              device=str(device))
+        _FLEX_MASK_CACHE[key] = m
+    return m
+
+
+if _HAVE_FLEX:
+    _swa_flex_mask = torch.compiler.disable(_swa_flex_mask)
 
 
 class ChunkAttention(SlidingWindowAttention):
@@ -176,7 +170,7 @@ class ChunkAttention(SlidingWindowAttention):
             # position-aware minting: query b sits at its boundary
             pos = ((torch.arange(nblk, device=x.device) + 1) * self.btok
                    - 1).repeat_interleave(self.k_slots)
-            qw = rope_at(qw, pos)
+            qw = rope_at(qw, pos, nblk * self.btok)
         scores = (qw @ k_r.transpose(-2, -1)) * hd ** -0.5    # (B,H,S,T)
         mask = _writer_mask(T, self.btok, nblk, self.k_slots, x.device)
         A = torch.softmax(
@@ -235,23 +229,24 @@ class ChunkAttention(SlidingWindowAttention):
         scale = hd ** -0.5
         vis = _chunk_vis_mask(T, self.btok, nblk, self.k_slots, x.device)
 
-        if (USE_FAST and dropout_p == 0.0 and x.device.type == "cuda"
-                and q.dtype in (torch.float16, torch.bfloat16)):
-            fast = _resolve_partial()
-            if fast is not None:
-                out_l, lse_l = fast(q_r, k_r, v, self.window)
-                s_c = (q @ ck.transpose(-2, -1)) * scale      # (B,H,T,S)
-                s_c = s_c.masked_fill(~vis, float("-inf"))
-                lse_c = torch.logsumexp(s_c.float(), dim=-1)  # (B,H,T)
-                out_c = torch.softmax(s_c, dim=-1).nan_to_num() @ cv
-                # joint softmax via LSE merge (rows with no visible
-                # chunks: lse_c = -inf -> weight 0 -> pure local)
-                m = torch.maximum(lse_l.float(), lse_c)
-                wl = (lse_l.float() - m).exp()[..., None]
-                wc = (lse_c - m).exp().nan_to_num()[..., None]
-                y = (out_l.float() * wl + out_c.float() * wc) / (wl + wc)
-                y = y.to(x.dtype).transpose(1, 2).reshape(B, T, C)
-                return self.resid_dropout(self.c_proj(y))
+        if (USE_FAST and _HAVE_FLEX and dropout_p == 0.0
+                and x.device.type == "cuda"):
+            from torch.nn.attention.flex_attention import flex_attention
+            mask = _swa_flex_mask(T, self.window, x.device)
+            out_l, lse_l = flex_attention(q_r, k_r, v, block_mask=mask,
+                                          return_lse=True)
+            s_c = (q @ ck.transpose(-2, -1)) * scale          # (B,H,T,S)
+            s_c = s_c.masked_fill(~vis, float("-inf"))
+            lse_c = torch.logsumexp(s_c.float(), dim=-1)      # (B,H,T)
+            out_c = torch.softmax(s_c, dim=-1).nan_to_num() @ cv
+            # joint softmax via LSE merge (rows with no visible chunks:
+            # lse_c = -inf -> weight 0 -> pure local)
+            m = torch.maximum(lse_l.float(), lse_c)
+            wl = (lse_l.float() - m).exp()[..., None]
+            wc = (lse_c - m).exp().nan_to_num()[..., None]
+            y = (out_l.float() * wl + out_c.float() * wc) / (wl + wc)
+            y = y.to(x.dtype).transpose(1, 2).reshape(B, T, C)
+            return self.resid_dropout(self.c_proj(y))
 
         # reference: materialised concat logits, one softmax
         s_l = (q_r @ k_r.transpose(-2, -1)) * scale           # (B,H,T,T)

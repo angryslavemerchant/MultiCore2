@@ -71,20 +71,36 @@ def real_cfg(pattern, dbase):
     return attn_cfg(dbase, 12, attn_pattern=pattern)
 
 
-@torch.no_grad()
-def module_parity(n_embd, n_head, T, B):
+def module_parity(n_embd, n_head, T, B, grads=False):
+    """Forward (and optionally BACKWARD) parity, fast vs reference.
+    The xformers-partial dead end was caught only at backward time —
+    never again trust a forward-only check for a training path."""
     torch.manual_seed(0)
     cfg = attn_cfg(n_embd, n_head)
-    m = ChunkAttention(cfg).cuda().to(torch.bfloat16).eval()
+    m = ChunkAttention(cfg).cuda().to(torch.bfloat16)
     x = torch.randn(B, T, n_embd, device="cuda", dtype=torch.bfloat16)
+
+    def run(fast):
+        chunk_mod.USE_FAST = fast
+        m.zero_grad(set_to_none=True)
+        xi = x.clone().requires_grad_(grads)
+        if grads:
+            out = m(xi)
+            out.float().square().mean().backward()
+            return out, xi.grad, m.wq.weight.grad, m.cmlp_up.weight.grad
+        with torch.no_grad():
+            return (m(xi), None, None, None)
+
+    f = run(True)
+    r = run(False)
     chunk_mod.USE_FAST = True
-    fast = m(x)
-    chunk_mod.USE_FAST = False
-    ref = m(x)
-    chunk_mod.USE_FAST = True
-    diff = (fast.float() - ref.float()).abs().max().item()
-    scale = ref.float().abs().max().item()
-    return diff, scale
+    diffs = {}
+    for name, a, b in zip(("out", "x_grad", "wq_grad", "cmlp_grad"), f, r):
+        if a is not None:
+            d = (a.float() - b.float()).abs().max().item()
+            s = b.float().abs().max().item()
+            diffs[name] = (d, s)
+    return diffs
 
 
 def timed_run(pattern, dbase, mb, iters, compile_model=True):
@@ -126,17 +142,20 @@ def main():
     assert torch.cuda.is_available()
     print(f"[validate_chunk] {torch.cuda.get_device_name(0)}", flush=True)
 
-    # 1. fast path must resolve
-    fn = chunk_mod._resolve_partial()
-    report("fast_path_resolves", fn is not None)
+    # 1. fast path must be available (flex with return_lse)
+    from core.gated_swa import _HAVE_FLEX
+    report("fast_path_resolves", _HAVE_FLEX)
 
-    # 2. module parity, fast (LSE merge) vs reference (concat softmax)
-    diff, scale = module_parity(384, 6, T=4096, B=1)
-    report("parity_T4096", diff < 3e-2 * max(scale, 1.0),
-           max_abs_diff=diff, ref_scale=scale)
-    diff, scale = module_parity(1152, 12, T=1024, B=2)
-    report("parity_T1024_fullwidth", diff < 3e-2 * max(scale, 1.0),
-           max_abs_diff=diff, ref_scale=scale)
+    # 2. module parity, fast (flex + LSE merge) vs reference (concat
+    # softmax) — forward at scale, forward+BACKWARD at full width
+    diffs = module_parity(384, 6, T=4096, B=1)
+    d, s = diffs["out"]
+    report("parity_T4096", d < 3e-2 * max(s, 1.0),
+           max_abs_diff=d, ref_scale=s)
+    diffs = module_parity(1152, 12, T=1024, B=2, grads=True)
+    for name, (d, s) in diffs.items():
+        report(f"parity_grads_{name}", d < 3e-2 * max(s, 1.0),
+               max_abs_diff=d, ref_scale=s)
 
     # 3. compiled vs eager logits on the real model (flex-mask lesson)
     torch.manual_seed(0)
