@@ -117,7 +117,12 @@ def module_parity(n_embd, n_head, T, B, grads=False):
     return diffs
 
 
-SELECTION_PARAMS = (".lam", ".gain", "slot_emb")
+# every param whose gradient routes exclusively through the mint
+# selection (writer head + chunk MLP + read-side dedup/gain): bf16
+# tie-flipped top-k picks perturb these first. The trunk params
+# (c_attn/c_proj/ln/canon/lm_head) are the gradient-correctness
+# sentinels -- their mass flows through local attention and the read.
+SELECTION_PARAMS = (".lam", ".gain", "slot_emb", "attn.wq.", ".cmlp_")
 
 
 def grad_cosines(model, compiled, idx, autocast=True):
