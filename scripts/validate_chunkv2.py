@@ -117,25 +117,40 @@ def module_parity(n_embd, n_head, T, B, grads=False):
     return diffs
 
 
-def grad_cosines(model, compiled, idx):
-    """Per-param grad cosine, compiled vs eager, on one bf16 step."""
+SELECTION_PARAMS = (".lam", ".gain", "slot_emb")
+
+
+def grad_cosines(model, compiled, idx, autocast=True):
+    """Per-param grad cosine, compiled vs eager. Returns worst over the
+    trunk and worst over the selection-sensitive writer params
+    (lam/gain/slot_emb) separately: bf16 low-bit diffs flip near-tied
+    top-k picks between compiled and eager, and the flipped SELECTIONS
+    land almost entirely on those tiny writer-side params (measured
+    2026-08-08: bf16 worst-10 all lam/gain/slot_emb at 0.982+, fp32
+    no-flex leg all params >= 0.99994 -- the math is right, the ties
+    are ties)."""
     grads = {}
     for tag, m in (("eager", model), ("compiled", compiled)):
         model.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        if autocast:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                _, loss = m(idx, targets=idx)
+        else:
             _, loss = m(idx, targets=idx)
         loss.backward()
         grads[tag] = {n: p.grad.detach().float().clone()
                       for n, p in model.named_parameters()
                       if p.grad is not None}
-    worst, worst_name = 1.0, None
+    worst = {"trunk": (1.0, None), "selection": (1.0, None)}
     for n in grads["eager"]:
         a, b = grads["eager"][n], grads["compiled"][n]
         c = torch.nn.functional.cosine_similarity(
             a.flatten(), b.flatten(), dim=0).item()
-        if c < worst:
-            worst, worst_name = c, n
-    return worst, worst_name
+        kind = ("selection" if any(t in n for t in SELECTION_PARAMS)
+                else "trunk")
+        if c < worst[kind][0]:
+            worst[kind] = (c, n)
+    return worst
 
 
 def timed_run(pattern, dbase, mb, iters):
@@ -203,10 +218,34 @@ def main():
     cdiff = (eager_l - comp_l).abs().max().item()
     del eager_l, comp_l
     report("compiled_vs_eager_logits", cdiff < 0.1, max_abs_logit_diff=cdiff)
-    worst, worst_name = grad_cosines(model, compiled, idx)
-    report("compiled_vs_eager_grads", worst > 0.995,
-           worst_cosine=round(worst, 5), worst_param=worst_name)
+    worst = grad_cosines(model, compiled, idx)
+    (ct, nt), (cs, ns) = worst["trunk"], worst["selection"]
+    report("compiled_vs_eager_grads_bf16", ct > 0.995 and cs > 0.97,
+           worst_trunk=round(ct, 5), worst_trunk_param=nt,
+           worst_selection=round(cs, 5), worst_selection_param=ns)
     del model, compiled
+    torch.cuda.empty_cache()
+
+    # 3b. fp32 leg, no flex anywhere (fp32 flex tiles blow 5090 smem):
+    # reference chunk path + dense-SDPA S layers at T=2048. This is the
+    # actual correctness proof -- every cosine must be ~1.
+    chunk_mod.USE_FAST = False
+    import core.gated_swa as gsw
+    flex_was = gsw.USE_FLEX
+    gsw.USE_FLEX = False
+    torch.manual_seed(0)
+    model = GPT(base_cfg(1152, 12, attn_pattern=ARM,
+                         block_size=2048)).cuda()
+    randomize_zero_inits(model)
+    idx32 = torch.randint(0, 50304, (1, 2048), device="cuda")
+    worst = grad_cosines(model, torch.compile(model), idx32,
+                         autocast=False)
+    chunk_mod.USE_FAST = True
+    gsw.USE_FLEX = flex_was
+    wc, wn = min(worst.values(), key=lambda t: t[0])
+    report("compiled_vs_eager_grads_fp32", wc > 0.9999,
+           worst_cosine=round(wc, 6), worst_param=wn)
+    del model
     torch.cuda.empty_cache()
 
     # 4. memory + speed: the arm vs the window-only control
