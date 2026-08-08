@@ -89,6 +89,10 @@ class GPTConfig:
     # (raw attention stays windowed at cfg.window). core/chunk.py.
     chunk_btok: int = 256      # write cadence (boundary every B_tok)
     chunk_k: int = 16          # chunks minted per boundary
+    # 0 = soft membership over the whole prefix (v0). >0 = hard top-k:
+    # each query keeps its chunk_topk best prefix tokens, softmax
+    # renormalized over the survivors (v0.1, NSA-selection-style).
+    chunk_topk: int = 0
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)

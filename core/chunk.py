@@ -144,8 +144,17 @@ class ChunkAttention(SlidingWindowAttention):
         C, K = cfg.n_embd, cfg.chunk_k
         self.btok = cfg.chunk_btok
         self.k_slots = K
+        self.topk = cfg.chunk_topk
+        if self.topk:
+            assert self.topk <= self.btok, (
+                "chunk_topk must not exceed chunk_btok: the first "
+                "boundary has only btok candidates")
         if self.FREE:
-            # rung-1 writer head: slot embeddings + shared content proj
+            # v0.1 writer head: K learned probe vectors ATTENTION-POOL
+            # the just-completed block (PMA-style) to form the queries --
+            # replaces v0's mean-pool + shared Linear (rung 1), same
+            # param names so checkpoints/tests stay stable: slot_emb =
+            # probes, wq = the pooling key/value projection.
             self.slot_emb = nn.Parameter(torch.randn(K, C) * 0.02)
             self.wq = nn.Linear(C, C, bias=cfg.bias)
         # chunk MLP: 2C -> C -> 2C bottleneck, residual on the raw mixes
@@ -154,16 +163,31 @@ class ChunkAttention(SlidingWindowAttention):
         self.cmlp_down.RESIDUAL_SCALE_INIT = True   # zero-init => identity
 
     # ------------------------------------------------------------ writer
+    def _queries(self, x, nblk):
+        """Attention-pooled queries: the K probes attend over the just-
+        completed block's hidden states (PMA-style), residual on the
+        probe. (B, H, S, hd)."""
+        B, T, C = x.shape
+        H, hd = self.n_head, C // self.n_head
+        K, S = self.k_slots, nblk * self.k_slots
+        blocks = self.wq(x[:, :nblk * self.btok]).view(
+            B, nblk, self.btok, H, hd).permute(0, 1, 3, 2, 4)
+        pr = self.slot_emb.view(K, H, hd).permute(1, 0, 2)    # (H,K,hd)
+        sc = (pr.unsqueeze(0).unsqueeze(0) @ blocks.transpose(-2, -1)
+              ) * hd ** -0.5                          # (B,nblk,H,K,btok)
+        qw = pr + torch.softmax(sc, dim=-1) @ blocks  # (B,nblk,H,K,hd)
+        return qw.permute(0, 2, 1, 3, 4).reshape(B, H, S, hd)
+
     def _membership(self, x, k_n, k_r, v, nblk):
-        """Free membership: generated queries cross-attend the prefix.
-        Returns raw chunk (key, value) mixes, (B, H, S, hd) each."""
+        """Free membership: generated queries cross-attend the prefix --
+        soft mixture (topk=0) or hard top-k selection with the softmax
+        renormalized over the survivors (gradient reaches the selected
+        members' scores; the selection itself gets none -- the NSA
+        trade). Returns raw chunk (key, value) mixes, (B,H,S,hd)."""
         B, T, C = x.shape
         H, hd = self.n_head, C // self.n_head
         S = nblk * self.k_slots
-        pooled = x[:, :nblk * self.btok].view(
-            B, nblk, self.btok, C).mean(2)                    # (B,nblk,C)
-        qw = self.slot_emb + self.wq(pooled)[:, :, None, :]   # (B,nblk,K,C)
-        qw = qw.view(B, S, H, hd).transpose(1, 2)             # (B,H,S,hd)
+        qw = self._queries(x, nblk)
         if self.qk_norm:
             qw = rms(qw)
         if self.use_rope:
@@ -173,9 +197,20 @@ class ChunkAttention(SlidingWindowAttention):
             qw = rope_at(qw, pos, nblk * self.btok)
         scores = (qw @ k_r.transpose(-2, -1)) * hd ** -0.5    # (B,H,S,T)
         mask = _writer_mask(T, self.btok, nblk, self.k_slots, x.device)
-        A = torch.softmax(
-            scores.masked_fill(~mask, float("-inf")), dim=-1)
-        return A @ k_n, A @ v
+        scores = scores.masked_fill(~mask, float("-inf"))
+        if not self.topk:
+            A = torch.softmax(scores, dim=-1)
+            return A @ k_n, A @ v
+        val, idx = scores.topk(self.topk, dim=-1)             # (B,H,S,k)
+        A = torch.softmax(val, dim=-1)
+
+        def take(t):   # (B,H,T,hd) -> selected members (B,H,S,k,hd)
+            src = t.unsqueeze(2).expand(B, H, S, T, hd)
+            return src.gather(3, idx.unsqueeze(-1).expand(
+                B, H, S, self.topk, hd))
+
+        return ((A.unsqueeze(-1) * take(k_n)).sum(3),
+                (A.unsqueeze(-1) * take(v)).sum(3))
 
     def _mint(self, x, k_n, k_r, v, nblk):
         """Write the log: raw membership mixes -> chunk MLP -> chunk KVs
@@ -292,12 +327,15 @@ def chunk_extra_keys(T, btok, k_slots, free):
     """Per-token extra attention keys of a chunk layer, for
     flops_per_token: log reads (K * mean visible boundaries) plus, for
     the free arm, the writer's cross-attention (K * (nblk+1)/2 keys per
-    token, from sum_b K*t_b / T). blocksum's span means are ~free."""
+    token, from sum_b K*t_b / T -- top-k does not change this: every
+    prefix key is still scored) and the K-probe block pooling (~K keys
+    per token). blocksum's span means are ~free."""
     nblk = max(T // btok - (1 if T % btok == 0 else 0), 0)
     if nblk <= 0:
         return 0.0
     blk_sum = sum(min(t // btok, nblk) for t in range(T))
     read = k_slots * blk_sum / T
-    write = (k_slots * sum((b + 1) * btok for b in range(nblk)) / T
+    write = ((k_slots * sum((b + 1) * btok for b in range(nblk)) / T
+              + k_slots * nblk * btok / T)
              if free else 0.0)
     return read + write

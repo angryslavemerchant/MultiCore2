@@ -103,6 +103,9 @@ def parse_args():
                     help="chunk layers (pattern K/B): write cadence")
     ap.add_argument("--chunk-k", type=int, default=16,
                     help="chunk layers: chunks minted per boundary")
+    ap.add_argument("--chunk-topk", type=int, default=0,
+                    help="chunk layers: hard top-k membership per query "
+                         "(0 = soft mixture over the whole prefix)")
     ap.add_argument("--cow-chunk", type=int, default=128,
                     help="C layers: chain-scan chunk (heads frozen within)")
     # Frankenstein stack (all default off; see core/model.py)
@@ -247,6 +250,7 @@ def main():
                     cow_chains=args.cow_chains,
                     cow_theta=args.cow_theta, cow_chunk=args.cow_chunk,
                     chunk_btok=args.chunk_btok, chunk_k=args.chunk_k,
+                    chunk_topk=args.chunk_topk,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

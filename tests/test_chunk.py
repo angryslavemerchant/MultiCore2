@@ -33,6 +33,34 @@ def logits_pair(cfg, idx, idx2):
 
 # ------------------------------------------------------------- causality
 
+def test_autoregressive_causality_topk():
+    """v0.1 hard selection is still a pure function of the prefix."""
+    torch.manual_seed(0)
+    idx = torch.randint(0, 128, (1, 200))
+    cfg = tiny(chunk_topk=16, chunk_k=2)
+    for p in (5, 64, 130):
+        idx2 = idx.clone()
+        idx2[0, p] = (idx2[0, p] + 1) % 128
+        a, b = logits_pair(cfg, idx, idx2)
+        assert torch.equal(a[0, :p], b[0, :p]), f"leak at p={p}"
+
+
+def test_topk_grads_reach_writer():
+    torch.manual_seed(0)
+    m = GPT(tiny(chunk_topk=8, chunk_k=2))
+    idx = torch.randint(0, 128, (1, 200))
+    _, loss = m(idx, targets=idx)
+    loss.backward()
+    attn = m.transformer.h[0].attn
+    for p in (attn.slot_emb, attn.wq.weight):
+        assert p.grad is not None and p.grad.abs().max() > 0
+
+
+def test_topk_exceeding_btok_asserts():
+    with pytest.raises(AssertionError):
+        ChunkAttention(tiny(chunk_topk=128, chunk_btok=64))
+
+
 @pytest.mark.parametrize("pattern", ["K", "B"])
 def test_autoregressive_causality(pattern):
     """Perturbing token p never moves logits at positions < p (writer,

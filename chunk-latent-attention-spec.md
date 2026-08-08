@@ -283,3 +283,32 @@ Byte-level base model. Query-conditioned *reading* (retrieval-time re-chunking).
 4. **Slot collapse** (all K queries converge) — slot-normalized competition is the fallback.
 5. **Within-block staleness**: a concept revised mid-block is invisible to chunks until the
    next tick. Bounded by `B_tok`; the local window covers the tail meanwhile.
+
+---
+
+## 12. v0.1 amendment (2026-08-08) — post-first-run redesign
+
+v0 result: chunk arm (12x K, btok=256, K=16, soft membership, rung-1
+head) val **3.1200** @ 2.5B tokens — 0.10 nats behind the pyramid
+champion (3.0199) at matched tokens/FLOPs; controls not run before the
+redesign. Changes, user-directed:
+
+- **Middle (waist) layers only** carry chunk machinery (e.g.
+  `SSSKKKKKKSSS`): the hourglass makes them the cheap layers; outer
+  layers stay plain w=256 SWA.
+- **Write more often, mint less**: btok=64, K=2.
+- **Attention-pooled queries** (rung-2): the K probes attend over the
+  just-completed block (PMA-style, residual on probe) instead of
+  mean-pool+Linear.
+- **Hard top-k membership** (topk=16): softmax renormalized over each
+  query's top-k prefix keys; gradient reaches selected members' scores,
+  the selection gets none (the NSA trade; their score-sharing trick is
+  the known fix if it starves).
+- Framing sharpened: blocksum == NSA's compression branch, so the
+  comparison is *NSA-style positional compression vs learned top-k
+  membership*, same cadence, same middle layers, one joint softmax
+  both arms.
+- Rejected en route: late-layer clone as query source (single writer
+  fed by a late layer) — token-causal but not compute-causal; early
+  layers can't read late-sourced chunks in one parallel pass. Revisit
+  only as late-read-only (chunks visible to layers >= writer source).
