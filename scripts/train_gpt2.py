@@ -326,13 +326,16 @@ def main():
         # training graph entirely (S layers -> flash, F -> SDPA causal),
         # so DDPOptimizer's graph splitting is safe again and the
         # backward/allreduce overlap comes back.
+        # K/B (chunk) layers keep flex_attention in the graph — flash
+        # never covers them, and DDPOptimizer chokes on flex ("'int'
+        # object has no attribute 'meta'", reconfirmed 8x 2026-08-08)
         flash_covers = (_gsw.USE_FLASH and not args.diff_attn
-                        and not any(c in args.attn_pattern for c in "GC")
+                        and not any(c in args.attn_pattern for c in "GCKB")
                         and torch.cuda.is_available()
                         and _gsw._resolve_flash() is not None)
         if ddp and not flash_covers and (
                 args.diff_attn
-                or any(c in args.attn_pattern for c in "GSC")):
+                or any(c in args.attn_pattern for c in "GSCKB")):
             # DDPOptimizer's graph-splitting chokes on flex_attention's
             # higher-order op inside the franken graph shape ("'int'
             # object has no attribute 'meta'", 2026-07-30: single-process
