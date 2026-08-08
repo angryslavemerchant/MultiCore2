@@ -93,6 +93,10 @@ class GPTConfig:
     # each query keeps its chunk_topk best prefix tokens, softmax
     # renormalized over the survivors (v0.1, NSA-selection-style).
     chunk_topk: int = 0
+    # Top-k side-stack (pattern letter T, core/sidestack.py): full causal
+    # attention whose MLP slot is replaced by a small transformer over the
+    # per-head top-k retrieved v slices. This is the per-head k.
+    side_topk: int = 16
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
@@ -139,14 +143,17 @@ class GPTConfig:
             f"{len(self.attn_pattern)} chars for "
             f"{self.n_layer_total()} layers")
         key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow",
-               "K": "chunk", "B": "blocksum"}
+               "K": "chunk", "B": "blocksum", "T": "topkside",
+               "R": "swaside"}
         return [key[c] for c in self.attn_pattern]
 
     def layer_windows(self):
         """Per-layer window: an int for windowed (S/G/C) layers, None for
         full layers. Resolves cfg.windows; empty = uniform cfg.window."""
         attns = self.layer_attns()
-        full = [k == self.attn for k in attns]
+        # topkside layers are full-attention layers (the branch replaces
+        # the MLP, not the window) — no window entry applies to them
+        full = [k == self.attn or k == "topkside" for k in attns]
         if not self.windows:
             return [None if f else self.window
                     for f, k in zip(full, attns)]
@@ -306,8 +313,7 @@ class SliceBlock(nn.Module):
         super().__init__()
         assert width % cfg.n_head == 0, (width, cfg.n_head)
         self.width = width
-        self.block = BLOCKS[cfg.block](replace(cfg, n_embd=width),
-                                       attn_key=attn_key)
+        self.block = make_block(replace(cfg, n_embd=width), attn_key)
 
     @property
     def attn(self):
@@ -333,6 +339,17 @@ MLPS = {"gelu": GeluMLP, "relu2": Relu2MLP}
 BLOCKS = {"gpt2": Block}
 
 
+def make_block(cfg, attn_key):
+    """Block construction seam: topkside (T, full) and swaside (R,
+    windowed) layers need a block whose MLP slot holds the side branch
+    (it consumes the attention's internals, so attention and branch
+    can't be independent registry entries)."""
+    if attn_key in ("topkside", "swaside"):
+        from core.sidestack import TopKSideBlock
+        return TopKSideBlock(cfg, attn_key=attn_key)
+    return BLOCKS[cfg.block](cfg, attn_key=attn_key)
+
+
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -342,7 +359,7 @@ class GPT(nn.Module):
             wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
             h=nn.ModuleList(
-                BLOCKS[lcfg.block](lcfg, attn_key=key) if w == cfg.n_embd
+                make_block(lcfg, key) if w == cfg.n_embd
                 else SliceBlock(lcfg, key, w)
                 for key, w, lcfg in (
                     (key, w,
@@ -474,6 +491,19 @@ class GPT(nn.Module):
             # hit the full value width: value application doubles -> 1.5x
             # on the attention term
             score *= 1.5
+        # side-stack branch (T/R layers): 6*N covers each param used once
+        # per token; the slice MLP / set-attention multiplicity, set
+        # scores, and the no-grad selection sweep are charged on top
+        # (core/sidestack.py). R layers' banded host attention is already
+        # counted at avg_keys(win) above.
+        attns = self.cfg.layer_attns()
+        if "topkside" in attns or "swaside" in attns:
+            from core.sidestack import side_extra_flops
+            score += sum(side_extra_flops(self.cfg, w, T, window=win)
+                         for k, w, win in zip(attns,
+                                              self.cfg.layer_widths(),
+                                              self.cfg.layer_windows())
+                         if k in ("topkside", "swaside"))
         return 6 * self.num_params() + score
 
     def configure_optimizers(self, weight_decay, lr, betas, device_type,

@@ -106,6 +106,9 @@ def parse_args():
     ap.add_argument("--chunk-topk", type=int, default=0,
                     help="chunk layers: hard top-k membership per query "
                          "(0 = soft mixture over the whole prefix)")
+    ap.add_argument("--side-topk", type=int, default=16,
+                    help="T layers (top-k side-stack): per-head k slices "
+                         "fed to the branch in the MLP slot")
     ap.add_argument("--cow-chunk", type=int, default=128,
                     help="C layers: chain-scan chunk (heads frozen within)")
     # Frankenstein stack (all default off; see core/model.py)
@@ -198,7 +201,10 @@ def parse_args():
                                 if args.recent_band else "")
                              + (f"-ck{args.chunk_k}b{args.chunk_btok}"
                                 if ("K" in args.attn_pattern
-                                    or "B" in args.attn_pattern) else ""))
+                                    or "B" in args.attn_pattern) else "")
+                             + (f"-st{args.side_topk}"
+                                if ("T" in args.attn_pattern
+                                    or "R" in args.attn_pattern) else ""))
         else:
             args.run_name = f"{args.scale}-{args.block}-{args.attn}-{args.mlp}"
         if args.pos == "rope":
@@ -251,6 +257,7 @@ def main():
                     cow_theta=args.cow_theta, cow_chunk=args.cow_chunk,
                     chunk_btok=args.chunk_btok, chunk_k=args.chunk_k,
                     chunk_topk=args.chunk_topk,
+                    side_topk=args.side_topk,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,
