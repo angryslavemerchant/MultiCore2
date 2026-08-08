@@ -166,24 +166,29 @@ def main():
         eager = model(idx, targets=idx)[0].float()
         comp = torch.compile(model)(idx, targets=idx)[0].float()
     cdiff = (eager - comp).abs().max().item()
-    del model
+    del model, eager, comp
     torch.cuda.empty_cache()
     report("compiled_vs_eager", cdiff < 0.1, max_abs_logit_diff=cdiff)
 
     # 4. memory + speed, both arms at the matched configs
+    # champion-era 5090 practice is mb2 single-card (mb4 was the 8x
+    # setting) — try mb4 for headroom info, fall back to mb2
     for pattern, dbase, name in (("K" * 12, args.dbase, "chunk"),
                                  ("B" * 12, args.dbase, "blocksum"),
                                  ("S" * 12, 1152, "window_only")):
-        try:
-            ms, peak, tps = timed_run(pattern, dbase, args.micro_bs,
-                                      args.iters)
-            report(f"bench_{name}", True, ms_per_iter=round(ms, 1),
-                   peak_gb=round(peak, 2), tok_per_s=round(tps),
-                   mb=args.micro_bs, dbase=dbase)
-        except torch.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            report(f"bench_{name}", False, fatal=False,
-                   oom_at_mb=args.micro_bs)
+        oom = []
+        for mb in (args.micro_bs, 2):
+            try:
+                ms, peak, tps = timed_run(pattern, dbase, mb, args.iters)
+                report(f"bench_{name}", True, ms_per_iter=round(ms, 1),
+                       peak_gb=round(peak, 2), tok_per_s=round(tps),
+                       mb=mb, oom_at=oom, dbase=dbase)
+                break
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                oom.append(mb)
+        else:
+            report(f"bench_{name}", False, fatal=False, oom_at=oom)
 
     if all(r["ok"] for r in RESULTS.values()):
         finish()
