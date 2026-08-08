@@ -118,9 +118,10 @@ def _select_topk(q, k, topk, window=None, chunk=None):
         return sc.float() if fp32 else sc
     t_idx = torch.arange(T, device=q.device)
     if window is not None:
-        # small query chunks keep the band strip tight: chunk 256 against
-        # w=128 computes a 383-wide strip (1.5x waste) vs 1151 at 1024
-        chunk = chunk or 256
+        # chunk 1024 computes a wastefully wide strip for small windows,
+        # but fewer/fatter kernels still beat tight strips at chunk 256
+        # (2x, bench 2026-08-08) -- launch overhead dominates band waste
+        chunk = chunk or 1024
         out = []
         kk = min(topk, T)
         for s in range(0, T, chunk):
@@ -248,10 +249,14 @@ class SideStack(nn.Module):
         seed = self.cls_proj(x).view(B, T, H, 1, hd)
         seq = torch.cat((seed, items), dim=3)                 # (B,T,H,N,hd)
         N = seq.shape[3]
-        qkv = self.wqkv(self.ln_set(seq)).view(B * T, H, N, 3, hd)
-        sq, sk, sv = (qkv[..., i, :] for i in range(3))       # (B*T,H,N,hd)
-        y = F.scaled_dot_product_attention(sq, sk, sv)        # bidirectional
-        seq = seq + self.wo(y.view(B, T, H, N, hd))
+        qkv = self.wqkv(self.ln_set(seq)).view(B, T, H, N, 3, hd)
+        sq, sk, sv = qkv.unbind(dim=4)                        # (B,T,H,N,hd)
+        # explicit bmm+softmax: at 17x17 the score matrices are tiny and
+        # every fused attention kernel loses to two batched GEMMs
+        # (perhead_bmm 2-3ms vs sdpa 8-9ms/layer, bench 2026-08-08)
+        sc = (sq @ sk.transpose(-2, -1)) * hd ** -0.5         # (B,T,H,N,N)
+        y = torch.softmax(sc, dim=-1) @ sv                    # bidirectional
+        seq = seq + self.wo(y)
         cls = self.ln_out(seq[:, :, :, 0])                    # (B,T,H,hd)
         return self.c_proj(
             F.relu(self.c_fc(cls.reshape(B, T, H * hd))).square())
