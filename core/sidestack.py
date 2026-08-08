@@ -25,6 +25,8 @@ head_dim. Per-slice return to token dim before the set attention would put
 ~1G MACs/position through it (~2x the rest of the model); at head_dim the
 whole branch is ~1% of model FLOPs. See topk-sidestack-spec.md.
 """
+import os
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -103,9 +105,17 @@ def _select_topk(q, k, topk, window=None, chunk=None):
     i.e. keys t-W+1..t), streamed over QUERY chunks against their band.
     Scores stay in the matmul dtype (bf16 under autocast) -- topk only
     needs ranks, and the fp32 upcast doubled the sweep's memory traffic
-    for nothing but tie-breaks (JP profile 2026-08-08)."""
+    for nothing but tie-breaks (JP profile 2026-08-08).
+    SIDESTACK_SWEEP_FP32=1 restores fp32 scores: the validation gate sets
+    it so compiled and eager pick IDENTICAL sets (bf16 reduction-order
+    diffs flip near-tied picks between implementations -- benign for
+    training, but it breaks the gate's compiled==eager premise)."""
     B, H, T, hd = q.shape
     scale = hd ** -0.5
+    fp32 = os.environ.get("SIDESTACK_SWEEP_FP32", "0") == "1"
+
+    def cast(sc):
+        return sc.float() if fp32 else sc
     t_idx = torch.arange(T, device=q.device)
     if window is not None:
         # small query chunks keep the band strip tight: chunk 256 against
@@ -116,7 +126,7 @@ def _select_topk(q, k, topk, window=None, chunk=None):
         for s in range(0, T, chunk):
             e = min(s + chunk, T)
             lo = max(0, s - window + 1)
-            sc = (q[:, :, s:e] @ k[:, :, lo:e].transpose(-2, -1)) * scale
+            sc = cast(q[:, :, s:e] @ k[:, :, lo:e].transpose(-2, -1)) * scale
             tq = torch.arange(s, e, device=q.device).view(1, 1, -1, 1)
             tk = torch.arange(lo, e, device=q.device).view(1, 1, 1, -1)
             sc = sc.masked_fill((tk > tq) | (tk <= tq - window),
@@ -136,7 +146,7 @@ def _select_topk(q, k, topk, window=None, chunk=None):
     best_val = best_idx = None
     for s in range(0, T, chunk):
         e = min(s + chunk, T)
-        sc = (q @ k[:, :, s:e].transpose(-2, -1)) * scale
+        sc = cast(q @ k[:, :, s:e].transpose(-2, -1)) * scale
         j = torch.arange(s, e, device=q.device)
         sc = sc.masked_fill(j[None, None, None, :] > t_idx[None, None, :, None],
                             float("-inf"))

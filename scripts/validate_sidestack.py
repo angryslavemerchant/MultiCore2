@@ -17,6 +17,12 @@ import json
 import os
 import sys
 
+# pin selection to fp32 for the gate: bf16 reduction-order diffs flip
+# near-tied top-k picks between compiled and eager (different-but-equally-
+# valid sets -> legitimately different grads), which would fail the
+# compiled==eager premise for reasons that don't affect training
+os.environ["SIDESTACK_SWEEP_FP32"] = "1"
+
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
