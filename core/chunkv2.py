@@ -138,8 +138,10 @@ class ChunkV2Attention(ChunkAttention):
             if self.qk_norm:
                 ckb = rms(ckb)
             slots = scol[b * K:(b + 1) * K]
-            ck_log = ck_log.index_copy(2, slots, ckb)
-            cv_log = cv_log.index_copy(2, slots, cvb)
+            # rms() upcasts under autocast; the log stays in k/v dtype
+            # (every consumer GEMM is autocast-bf16 regardless)
+            ck_log = ck_log.index_copy(2, slots, ckb.to(ck_log.dtype))
+            cv_log = cv_log.index_copy(2, slots, cvb.to(cv_log.dtype))
             ptrs.append(idx)
             oks.append(idx < p)                     # raw iff < T & < p
         ptr = torch.cat(ptrs, dim=2).clamp(max=T - 1)     # refs masked by ok
