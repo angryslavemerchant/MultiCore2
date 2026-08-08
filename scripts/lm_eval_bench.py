@@ -35,7 +35,11 @@ def build_lm(ckpt_path, device, batch_size):
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg = GPTConfig(**ckpt["config"])
     model = GPT(cfg).to(device).eval()
-    model.load_state_dict(ckpt["model"])
+    # v0-era chunk checkpoints predate the v0.1 writer gain (init 1.0 ==
+    # the exact soft behavior they trained with) — tolerate ONLY that
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    assert not unexpected, unexpected
+    assert all(m.endswith(".gain") for m in missing), missing
     tok = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     T = cfg.block_size
     print(f"loaded {ckpt_path}: step {ckpt['step']}, "

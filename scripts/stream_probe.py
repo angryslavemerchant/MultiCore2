@@ -119,7 +119,11 @@ def main():
                       map_location=device)
     cfg = GPTConfig(**ckpt["config"])
     model = GPT(cfg).to(device).eval()
-    model.load_state_dict(ckpt["model"])
+    # v0-era chunk checkpoints predate the v0.1 writer gain (init 1.0 ==
+    # the exact soft behavior they trained with) — tolerate ONLY that
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    assert not unexpected, unexpected
+    assert all(m.endswith(".gain") for m in missing), missing
 
     from transformers import AutoTokenizer
     hf = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
