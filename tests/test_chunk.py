@@ -111,7 +111,8 @@ def test_writer_gets_gradient():
     _, loss = m(idx, targets=idx)
     loss.backward()
     attn = m.transformer.h[0].attn
-    for p in (attn.slot_emb, attn.wq.weight, attn.cmlp_up.weight):
+    for p in (attn.slot_emb, attn.wq.weight, attn.cmlp_up.weight,
+              attn.gain):
         assert p.grad is not None and p.grad.abs().max() > 0
 
 

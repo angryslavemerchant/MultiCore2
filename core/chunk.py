@@ -157,6 +157,11 @@ class ChunkAttention(SlidingWindowAttention):
             # probes, wq = the pooling key/value projection.
             self.slot_emb = nn.Parameter(torch.randn(K, C) * 0.02)
             self.wq = nn.Linear(C, C, bias=cfg.bias)
+            # learnable per-head logit gain on the membership scores:
+            # qk-norm bounds writer logits to ~[-1, 1], which caps the
+            # softmax at near-flat over thousands of candidates; the
+            # gain lets each head EARN its sharpness (init 1 = soft).
+            self.gain = nn.Parameter(torch.ones(cfg.n_head))
         # chunk MLP: 2C -> C -> 2C bottleneck, residual on the raw mixes
         self.cmlp_up = nn.Linear(2 * C, C, bias=cfg.bias)
         self.cmlp_down = nn.Linear(C, 2 * C, bias=cfg.bias)
@@ -196,6 +201,8 @@ class ChunkAttention(SlidingWindowAttention):
                    - 1).repeat_interleave(self.k_slots)
             qw = rope_at(qw, pos, nblk * self.btok)
         scores = (qw @ k_r.transpose(-2, -1)) * hd ** -0.5    # (B,H,S,T)
+        if self.FREE:
+            scores = scores * self.gain.view(1, -1, 1, 1)
         mask = _writer_mask(T, self.btok, nblk, self.k_slots, x.device)
         scores = scores.masked_fill(~mask, float("-inf"))
         if not self.topk:
