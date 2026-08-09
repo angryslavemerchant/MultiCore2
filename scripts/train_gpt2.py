@@ -125,6 +125,12 @@ def parse_args():
     ap.add_argument("--chunk-fetch-n", type=int, default=4,
                     help="N layers (chunk v0.2): raw-fetch the pointer "
                          "sets of each query's top-n chunks (0 disables)")
+    ap.add_argument("--nsa-block", type=int, default=32,
+                    help="NSA summary/selection block size (--attn nsa)")
+    ap.add_argument("--nsa-topk", type=int, default=12,
+                    help="NSA blocks fetched by the slc branch")
+    ap.add_argument("--nsa-nreg", type=int, default=1024,
+                    help="learned register vectors per NSA layer")
     ap.add_argument("--side-topk", type=int, default=16,
                     help="T layers (top-k side-stack): per-head k slices "
                          "fed to the branch in the MLP slot")
@@ -215,6 +221,12 @@ def parse_args():
                              f"-mem{args.mem_slots // 1024}k"
                              + ("-swa" if args.token_mode == "swa"
                                 else ""))
+        elif args.attn == "nsa":
+            args.run_name = (f"{args.scale}-nsa-b{args.nsa_block}"
+                             f"k{args.nsa_topk}-reg{args.nsa_nreg}"
+                             f"-w{args.window}"
+                             + (f"-hg{args.hg_frac}d{args.hg_dbase}"
+                                if args.hg_frac else ""))
         elif args.hg_frac:
             args.run_name = (f"{args.scale}-hg-f{args.hg_frac}"
                              f"-b{args.hg_bneck}"
@@ -294,6 +306,8 @@ def main():
                     chunk_topk=args.chunk_topk,
                     chunk_fetch_n=args.chunk_fetch_n,
                     side_topk=args.side_topk, loops=args.loops,
+                    nsa_block=args.nsa_block, nsa_topk=args.nsa_topk,
+                    nsa_nreg=args.nsa_nreg,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

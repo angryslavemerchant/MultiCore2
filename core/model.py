@@ -103,6 +103,14 @@ class GPTConfig:
     # attention whose MLP slot is replaced by a small transformer over the
     # per-head top-k retrieved v slices. This is the per-head k.
     side_topk: int = 16
+    # NSA-with-registers (attn="nsa", core/nsa.py, 2026-08-09): every
+    # layer = 128-swa + block-summary cmp branch + top-k selected fine
+    # branch, with nsa_nreg learned register vectors (KV-only, grouped
+    # into nsa_block-sized blocks) always visible to cmp and selectable
+    # by slc. cfg.window is the swa branch's window.
+    nsa_block: int = 32        # summary/selection granularity
+    nsa_topk: int = 12         # blocks fetched by the slc branch
+    nsa_nreg: int = 1024       # learned register vectors per layer
     # Uberloop (2026-08-09): per-layer weight-tied loop counts, comma-
     # separated, one entry per layer ("1,1,1,2,2,4,4,4,4,2,1,1"). A layer
     # with count L runs its block L times per forward (shared weights);
@@ -391,6 +399,7 @@ from core.gated_swa import SlidingWindowAttention, GatedSWAttention  # noqa: E40
 from core.cow import COWAttention  # noqa: E402
 from core.chunk import ChunkAttention, BlockSumAttention  # noqa: E402
 from core.chunkv2 import ChunkV2Attention  # noqa: E402
+from core.nsa import NSARegisterAttention  # noqa: E402
 
 # The seams. The new architecture adds entries here; the config selects them.
 ATTENTIONS = {"causal": CausalSelfAttention,
@@ -399,7 +408,8 @@ ATTENTIONS = {"causal": CausalSelfAttention,
               "cow": COWAttention,
               "chunk": ChunkAttention,
               "blocksum": BlockSumAttention,
-              "chunkv2": ChunkV2Attention}
+              "chunkv2": ChunkV2Attention,
+              "nsa": NSARegisterAttention}
 MLPS = {"gelu": GeluMLP, "relu2": Relu2MLP}
 BLOCKS = {"gpt2": Block}
 
@@ -550,10 +560,17 @@ class GPT(nn.Module):
         chunk_keys["chunkv2"] = chunkv2_extra_keys(
             T, self.cfg.chunk_btok, self.cfg.chunk_k,
             self.cfg.chunk_topk, self.cfg.chunk_fetch_n)
+        # nsa layers: swa window + cmp summaries + dense-with-mask slc
+        # (charged at its executed T + n_reg, not the surviving top-k)
+        from core.nsa import nsa_extra_keys
+        nsa_keys = nsa_extra_keys(T, self.cfg.nsa_block,
+                                  self.cfg.nsa_topk, self.cfg.nsa_nreg,
+                                  self.cfg.window)
         # hourglass layers score at their own (narrower) width; windowed
         # layers at their own (per-layer, cfg.windows) window; looped
         # layers score once per iteration
-        score = sum(lp * 12 * w * (T if win is None
+        score = sum(lp * 12 * w * (nsa_keys if k == "nsa"
+                                   else T if win is None
                                    else cow_keys if k == "cow"
                                    else avg_keys(win) + chunk_keys.get(k, 0.0))
                     for k, w, win, lp in zip(self.cfg.layer_attns(),
@@ -603,7 +620,8 @@ class GPT(nn.Module):
         if opt == "muon":
             from core.muon import Muon, ComboOptimizer
             hidden = [p for n, p in params
-                      if p.dim() == 2 and n.startswith("transformer.h.")]
+                      if p.dim() == 2 and n.startswith("transformer.h.")
+                      and not n.endswith(".registers")]  # embeddings-like
             hid_ids = {id(p) for p in hidden}
             rest = [p for _, p in params if id(p) not in hid_ids]
             decay = [p for p in rest if p.dim() >= 2]
