@@ -60,6 +60,11 @@ def parse_args():
                     help="hier token stacks: independent 128-windows "
                          "(block) or true w128 sliding window over the "
                          "full sequence (swa, NSA-style)")
+    ap.add_argument("--levels", type=int, default=2, choices=(2, 3),
+                    help="hier: 3 switches on the v3 bundle (3rd level, "
+                         "learned pooling, dynamic gates, latent losses)")
+    ap.add_argument("--btok", type=int, default=128,
+                    help="hier: block length in tokens (v3 run: 32)")
     ap.add_argument("--block", default="gpt2")
     ap.add_argument("--attn", default="causal")
     ap.add_argument("--mlp", default="gelu")
@@ -204,7 +209,9 @@ def parse_args():
         assert args.hg_dbase, "--hg-dbase required with --hg-frac"
     if args.run_name is None:
         if args.arch == "hier":
-            args.run_name = (f"{args.scale}-hier-b128x32-sb8"
+            nb = args.seq_len // args.btok
+            args.run_name = (f"{args.scale}-hier-b{args.btok}x{nb}"
+                             f"-L{args.levels}"
                              f"-mem{args.mem_slots // 1024}k"
                              + ("-swa" if args.token_mode == "swa"
                                 else ""))
@@ -299,7 +306,8 @@ def main():
         cfg = HierConfig(block_size=args.seq_len, vocab_size=VOCAB_SIZE,
                          mem_slots=args.mem_slots, softcap=args.softcap,
                          dropout=args.dropout,
-                         token_mode=args.token_mode)
+                         token_mode=args.token_mode,
+                         levels=args.levels, btok=args.btok)
         model = HierGPT(cfg).to(device)
         cfg_to_dict = hier_config_dict
     else:

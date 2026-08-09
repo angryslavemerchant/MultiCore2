@@ -93,12 +93,12 @@ def test_plans_only_from_past_blocks():
     with torch.no_grad():
         H = m._analyze(idx)
         S, U = m._summaries(H, 1)
-        P, G = m._plans(S, U)
+        P, G, _ = m._plans(S, U)
         pert = idx.clone()
         pert[0, 192:256] = (pert[0, 192:256] + 1) % 256   # block 3
         H2 = m._analyze(pert)
         S2, U2 = m._summaries(H2, 1)
-        P2, G2 = m._plans(S2, U2)
+        P2, G2, _ = m._plans(S2, U2)
     assert torch.equal(P[:, :4], P2[:, :4])       # P_0..P_3 unchanged
     assert not torch.equal(P[:, 4], P2[:, 4])     # P_4 sees S_3
 
@@ -265,12 +265,12 @@ def test_swa_mode_plans_still_blockwise_causal():
     with torch.no_grad():
         H = m._analyze(idx)
         S, U = m._summaries(H, 1)
-        P, _ = m._plans(S, U)
+        P, _, _ = m._plans(S, U)
         pert = idx.clone()
         pert[0, 192:256] = (pert[0, 192:256] + 1) % 256   # block 3
         H2 = m._analyze(pert)
         S2, U2 = m._summaries(H2, 1)
-        P2, _ = m._plans(S2, U2)
+        P2, _, _ = m._plans(S2, U2)
     # swa reach backward: only blocks whose WINDOWS see block 3 change;
     # plans for blocks 0..3 use S_{<b} of untouched-or-earlier blocks.
     # P_0..P_3 depend on S_0..S_2; S_2's tokens can't see block 3
@@ -291,3 +291,81 @@ def test_swa_mode_loss_and_shapes():
     loss.backward()
     p = dict(m.named_parameters())["memory.values.weight"]
     assert p.grad is not None and p.grad.abs().sum() > 0
+
+
+# ------------------------------------------------------------- v3 (3 levels)
+
+def tiny3(**kw):
+    # 512-token sequences: 16 blocks of 32, 4 supers of 4, 2 hypers of 2
+    base = dict(levels=3, btok=32, blocks_per_super=4,
+                supers_per_hyper=2, d_hyp=24, n_head_hyp=2,
+                token_mode="swa")
+    base.update(kw)
+    return tiny(**base)
+
+
+def test_v3_forward_and_latent_loss():
+    torch.manual_seed(0)
+    m = randomize_zero_inits(HierGPT(tiny3()))
+    idx = torch.randint(0, 256, (2, 512))
+    tgt = idx.roll(-1, dims=1)
+    m.eval()
+    _, val_loss = m(idx, tgt)
+    m.train()
+    _, train_loss = m(idx, tgt)
+    assert train_loss.item() > val_loss.item()   # aux + latent added
+    assert hasattr(m, "last_latent_loss") and m.last_latent_loss > 0
+    stats = m.memory_stats()
+    for k in ("collapse/S_paircos", "collapse/U_paircos",
+              "collapse/V_paircos"):
+        assert k in stats
+
+
+def test_v3_causality_hyper_boundary():
+    torch.manual_seed(0)
+    m = randomize_zero_inits(HierGPT(tiny3())).eval()
+    idx = torch.randint(0, 256, (1, 512))
+    base = logits_of(m, idx)
+    pert = idx.clone()
+    pert[0, 256:] = (pert[0, 256:] + 1) % 256    # entire hyper 1
+    after = logits_of(m, pert)
+    assert torch.equal(base[0, :224], after[0, :224])
+
+
+def test_v3_dynamic_gates_and_pool_grads():
+    torch.manual_seed(0)
+    m = randomize_zero_inits(HierGPT(tiny3())).train()
+    # gate bias must be -2 (small-but-nonzero start), not init-zeroed
+    for g in m.cond_dyn:
+        assert torch.allclose(g.bias, torch.full_like(g.bias, -2.0))
+    idx = torch.randint(0, 256, (2, 512))
+    _, loss = m(idx, idx.roll(-1, dims=1))
+    loss.backward()
+    named = dict(m.named_parameters())
+    for n in ("pool_blk.q", "pool_sup.w.weight", "pool_hyp.q",
+              "cond_dyn.0.weight", "hyper_bos", "w_cond_hy.weight"):
+        assert named[n].grad is not None and \
+            named[n].grad.abs().sum() > 0, n
+
+
+def test_v3_muon_classification():
+    m = HierGPT(tiny3())
+    combo = m.configure_optimizers(0.1, 6e-4, (0.9, 0.95), "cpu",
+                                   opt="muon")
+    muon_ids = {id(p) for g in combo.opts[0].param_groups
+                for p in g["params"]}
+    named = dict(m.named_parameters())
+    assert any(id(p) in muon_ids for n, p in named.items()
+               if n.startswith("transformer.hyperpred.") and p.dim() == 2)
+    assert id(named["pool_blk.w.weight"]) not in muon_ids
+    assert id(named["pool_blk.q"]) not in muon_ids
+
+
+def test_v2_checkpoint_compat_unchanged():
+    # levels=2 model must be state-dict-identical to before the v3 work
+    torch.manual_seed(0)
+    m = HierGPT(tiny())
+    keys = set(m.state_dict().keys())
+    assert not any("pool_" in k or "hyper" in k or "cond_dyn" in k
+                   for k in keys)
+    assert "w_summary.weight" in keys and "cond_gate" in keys

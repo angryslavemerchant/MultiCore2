@@ -55,6 +55,19 @@ class HierConfig:
     vocab_size: int = 50304
     btok: int = 128            # window == stride (no overlap, run one)
     blocks_per_super: int = 8
+    # levels=3 (run three) switches on the v3 feature set as a bundle:
+    # a third hierarchy level (supers_per_hyper supers -> hyper units),
+    # learned attention pooling for all summaries, per-token per-channel
+    # dynamic conditioning gates, and per-level latent predictive losses
+    # (1 - cos(pred, sg(target)), JEPA-style, targets stop-gradded;
+    # token-aux heads stay as the collapse anchor). levels=2 preserves
+    # runs one/two exactly (mean+last pooling, static scalar gates).
+    levels: int = 2
+    supers_per_hyper: int = 8
+    d_hyp: int = 256
+    n_head_hyp: int = 4
+    n_hyperpred: int = 2
+    latent_coef: float = 0.05
     d_tok: int = 768
     d_blk: int = 512
     d_sup: int = 384
@@ -96,6 +109,11 @@ class HierConfig:
         assert nb % self.blocks_per_super == 0
         return nb // self.blocks_per_super
 
+    def n_hypers(self):
+        ns = self.n_supers()
+        assert ns % self.supers_per_hyper == 0
+        return ns // self.supers_per_hyper
+
     def sub_keys(self):
         n = int(math.isqrt(self.mem_slots))
         assert n * n == self.mem_slots, "mem_slots must be a square"
@@ -112,6 +130,25 @@ def _stack_cfg(cfg, d, n_layer, n_head, T, canon, window=0):
                      qk_norm=True, canon=canon, canon_full=canon,
                      untied=True, zero_init=True,
                      window=window or 512)
+
+
+class AttnPool(nn.Module):
+    """Learned attention pooling (v3 summaries): one learned query
+    scores the window's states; output = W[pooled ; last] normalized.
+    Strictly richer than the v2 mean+last statistic."""
+
+    def __init__(self, cfg, d_in, d_out):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(d_in) * 0.02)
+        self.w = nn.Linear(2 * d_in, d_out, bias=False)
+        self.ln = make_norm(_stack_cfg(cfg, d_out, 1, 1, 1, False), d_out)
+
+    def forward(self, h):
+        # h: (..., W, d_in), window on dim -2
+        a = torch.softmax(
+            (h @ self.q) / h.shape[-1] ** 0.5, dim=-1)
+        pooled = (a.unsqueeze(-1) * h).sum(-2)
+        return self.ln(self.w(torch.cat((pooled, h[..., -1, :]), -1)))
 
 
 class ProductKeyMemory(nn.Module):
@@ -213,13 +250,26 @@ class HierGPT(nn.Module):
             ln_f=make_norm(_stack_cfg(cfg, cfg.d_tok, 1, 1, 1, False),
                            cfg.d_tok),
         ))
-        # summaries: [mean ; last] -> next level
-        self.w_summary = nn.Linear(2 * cfg.d_tok, cfg.d_blk, bias=False)
-        self.ln_summary = make_norm(
-            _stack_cfg(cfg, cfg.d_blk, 1, 1, 1, False), cfg.d_blk)
-        self.w_super = nn.Linear(2 * cfg.d_blk, cfg.d_sup, bias=False)
-        self.ln_super = make_norm(
-            _stack_cfg(cfg, cfg.d_sup, 1, 1, 1, False), cfg.d_sup)
+        if cfg.levels == 3:
+            self.transformer["hyperpred"] = nn.ModuleList(
+                stack(cfg.d_hyp, cfg.n_hyperpred, cfg.n_head_hyp,
+                      cfg.n_hypers(), False))
+            # v3: learned attention pooling at every level
+            self.pool_blk = AttnPool(cfg, cfg.d_tok, cfg.d_blk)
+            self.pool_sup = AttnPool(cfg, cfg.d_blk, cfg.d_sup)
+            self.pool_hyp = AttnPool(cfg, cfg.d_sup, cfg.d_hyp)
+            self.hyper_bos = nn.Parameter(torch.zeros(cfg.d_hyp))
+            self.w_cond_hy = nn.Linear(cfg.d_hyp, cfg.d_sup, bias=False)
+        else:
+            # v2: [mean ; last] linear summaries
+            self.w_summary = nn.Linear(2 * cfg.d_tok, cfg.d_blk,
+                                       bias=False)
+            self.ln_summary = make_norm(
+                _stack_cfg(cfg, cfg.d_blk, 1, 1, 1, False), cfg.d_blk)
+            self.w_super = nn.Linear(2 * cfg.d_blk, cfg.d_sup,
+                                     bias=False)
+            self.ln_super = make_norm(
+                _stack_cfg(cfg, cfg.d_sup, 1, 1, 1, False), cfg.d_sup)
         # shifted-sequence inputs
         self.block_bos = nn.Parameter(torch.zeros(cfg.d_blk))
         self.super_bos = nn.Parameter(torch.zeros(cfg.d_sup))
@@ -231,12 +281,24 @@ class HierGPT(nn.Module):
         self.ln_mem = make_norm(
             _stack_cfg(cfg, cfg.d_blk, 1, 1, 1, False), cfg.d_blk)
         # top-down conditioning into the prediction stack
-        self.w_c = nn.Linear(cfg.d_blk + cfg.d_sup, cfg.d_tok, bias=False)
+        c_in = cfg.d_blk + cfg.d_sup + (cfg.d_hyp if cfg.levels == 3
+                                        else 0)
+        self.w_c = nn.Linear(c_in, cfg.d_tok, bias=False)
         self.cond_proj = nn.ModuleList(
             nn.Linear(cfg.d_tok, cfg.d_tok, bias=False)
             for _ in range(cfg.n_predict))
-        self.cond_gate = nn.Parameter(
-            torch.full((cfg.n_predict,), -2.0))
+        if cfg.levels == 3:
+            # per-token per-channel dynamic gates; bias -2 so the
+            # conditioning path starts small-but-nonzero like v2
+            self.cond_dyn = nn.ModuleList(
+                nn.Linear(cfg.d_tok, cfg.d_tok)
+                for _ in range(cfg.n_predict))
+            with torch.no_grad():
+                for m in self.cond_dyn:
+                    m.bias.fill_(-2.0)
+        else:
+            self.cond_gate = nn.Parameter(
+                torch.full((cfg.n_predict,), -2.0))
         # aux heads (share the lm_head vocab matrix)
         self.aux_offsets = tuple(
             cfg.btok // 8 * (k + 1) - 1 for k in range(8))  # 15..127
@@ -252,6 +314,10 @@ class HierGPT(nn.Module):
         for name, p in self.named_parameters():
             if name.endswith("c_proj.weight"):
                 nn.init.zeros_(p)                # zero-init residuals
+        if cfg.levels == 3:
+            with torch.no_grad():                # _init_weights zeroed it
+                for m in self.cond_dyn:
+                    m.bias.fill_(-2.0)
         # eval-time switches (capability attribution, not training knobs)
         self.disable_memory = False
         self.disable_cond = False
@@ -280,27 +346,58 @@ class HierGPT(nn.Module):
 
     def _summaries(self, h, B):
         cfg = self.cfg
+        hb = (h.view(B, -1, cfg.btok, cfg.d_tok)
+              if cfg.token_mode == "swa"
+              else h.view(B, h.shape[0] // B, cfg.btok, cfg.d_tok))
+        if cfg.levels == 3:
+            S = self.pool_blk(hb)                       # (B,NB,d_blk)
+            g = S.view(B, cfg.n_supers(), cfg.blocks_per_super,
+                       cfg.d_blk)
+            U = self.pool_sup(g)                        # (B,NS,d_sup)
+            v = U.view(B, cfg.n_hypers(), cfg.supers_per_hyper,
+                       cfg.d_sup)
+            V = self.pool_hyp(v)                        # (B,NH,d_hyp)
+            with torch.no_grad():                       # collapse tripwire
+                self.latent_stats = {}
+                for tag, X in (("S", S), ("U", U), ("V", V)):
+                    n = torch.nn.functional.normalize(
+                        X[0].float(), dim=-1)
+                    sim = n @ n.T
+                    off = sim.numel() - sim.shape[0]
+                    self.latent_stats[f"collapse/{tag}_paircos"] = float(
+                        (sim.sum() - sim.trace()) / max(off, 1))
+            return S, U, V
         if cfg.token_mode == "swa":
-            hb = h.view(B, -1, cfg.btok, cfg.d_tok)     # (B,NB,128,768)
             core = torch.cat((hb.mean(dim=2), hb[:, :, -1]), dim=-1)
             S = self.ln_summary(self.w_summary(core))   # (B,NB,512)
         else:
-            NB = h.shape[0] // B
-            core = torch.cat((h.mean(dim=1), h[:, -1]), dim=-1)
-            S = self.ln_summary(
-                self.w_summary(core)).view(B, NB, cfg.d_blk)
+            NB = hb.shape[1]
+            core = torch.cat((hb.mean(dim=2), hb[:, :, -1]), dim=-1)
+            S = self.ln_summary(self.w_summary(core))
         g = S.view(B, cfg.n_supers(), cfg.blocks_per_super, cfg.d_blk)
         U = self.ln_super(self.w_super(
             torch.cat((g.mean(dim=2), g[:, :, -1]), dim=-1)))
         return S, U                                     # (B,NB,512),(B,NS,384)
 
-    def _plans(self, S, U):
+    def _plans(self, S, U, V=None):
         cfg = self.cfg
         B, NB, _ = S.shape
         NS = cfg.n_supers()
-        # super plans from shifted U
+        Hy = None
+        # hyper plans from shifted V (v3 only)
+        if cfg.levels == 3:
+            hy_in = torch.cat(
+                (self.hyper_bos.expand(B, 1, -1), V[:, :-1]), dim=1)
+            hh = hy_in
+            for blk in self.transformer.hyperpred:
+                hh = blk(hh)
+            Hy = hh                                     # (B,NH,d_hyp)
+        # super plans from shifted U (conditioned by hyper plans in v3)
         sup_in = torch.cat(
             (self.super_bos.expand(B, 1, -1), U[:, :-1]), dim=1)
+        if Hy is not None:
+            sup_in = sup_in + self.w_cond_hy(Hy).repeat_interleave(
+                cfg.supers_per_hyper, dim=1)
         gh = sup_in
         for blk in self.transformer.superpred:
             gh = blk(gh)
@@ -318,33 +415,43 @@ class HierGPT(nn.Module):
             ph = blk(ph)
             if i == mem_layer and not self.disable_memory:
                 ph = ph + self.mem_gate * self.memory(self.ln_mem(ph))
-        return ph, G                                    # P:(B,NB,512)
+        return ph, G, Hy                                # P:(B,NB,512)
 
-    def _predict(self, idx, P, G):
+    def _predict(self, idx, P, G, Hy=None):
         cfg = self.cfg
         B, T = idx.shape
         NB = T // cfg.btok
         g_per_block = G.unsqueeze(2).expand(
             -1, -1, cfg.blocks_per_super, -1).reshape(B, NB, cfg.d_sup)
-        C = self.w_c(torch.cat((P, g_per_block), dim=-1))  # (B,NB,768)
+        parts = [P, g_per_block]
+        if cfg.levels == 3:
+            per_hyper = cfg.blocks_per_super * cfg.supers_per_hyper
+            parts.append(Hy.unsqueeze(2).expand(
+                -1, -1, per_hyper, -1).reshape(B, NB, cfg.d_hyp))
+        C = self.w_c(torch.cat(parts, dim=-1))          # (B,NB,768)
+
+        def inject(h, i, c_tok):
+            if self.disable_cond:
+                return h
+            if cfg.levels == 3:
+                return h + torch.sigmoid(self.cond_dyn[i](h)) * c_tok
+            return h + torch.sigmoid(self.cond_gate[i]) * c_tok
+
         x = self.transformer.wte(idx)
         if cfg.token_mode == "swa":
             h = x                                       # (B,T,768)
             for i, blk in enumerate(self.transformer.predict):
                 h = blk(h)
-                if not self.disable_cond:
-                    ci = self.cond_proj[i](C)           # per-block GEMM
-                    h = h + torch.sigmoid(self.cond_gate[i]) \
-                        * ci.repeat_interleave(cfg.btok, dim=1)
+                ci = self.cond_proj[i](C)               # per-block GEMM
+                h = inject(h, i,
+                           ci.repeat_interleave(cfg.btok, dim=1))
             h = self.transformer.ln_f(h)
             return h
         Cw = C.view(B * NB, 1, cfg.d_tok)
         h = x.view(B * NB, cfg.btok, cfg.d_tok)
         for i, blk in enumerate(self.transformer.predict):
             h = blk(h)
-            if not self.disable_cond:
-                h = h + torch.sigmoid(self.cond_gate[i]) \
-                    * self.cond_proj[i](Cw)
+            h = inject(h, i, self.cond_proj[i](Cw))
         h = self.transformer.ln_f(h)
         return h.view(B, T, cfg.d_tok)
 
@@ -359,9 +466,13 @@ class HierGPT(nn.Module):
         assert T == cfg.block_size, (
             f"hier run-one supports full-length sequences only, got {T}")
         H = self._analyze(idx)
-        S, U = self._summaries(H, B)
-        P, G = self._plans(S, U)
-        h = self._predict(idx, P, G)
+        if cfg.levels == 3:
+            S, U, V = self._summaries(H, B)
+            P, G, Hy = self._plans(S, U, V)
+        else:
+            S, U = self._summaries(H, B)
+            P, G, Hy = self._plans(S, U)
+        h = self._predict(idx, P, G, Hy)
         if targets is None:
             return self._cap(self.lm_head(h[:, [-1], :])), None
         logits = self._cap(self.lm_head(h))
@@ -374,6 +485,19 @@ class HierGPT(nn.Module):
             loss = loss + cfg.aux_block_coef * self._aux_block(P, idx) \
                         + cfg.aux_super_coef * self._aux_super(G, idx) \
                         + cfg.route_coef * self.memory.lb_loss
+            if cfg.levels == 3:
+                # JEPA-style per-level latent prediction: predictor
+                # chases the (stop-gradded) observed summary. Token-aux
+                # heads above are the collapse anchor; the tripwire in
+                # _summaries watches pairwise cos per level.
+                lat = (1 - F.cosine_similarity(
+                           P, S.detach(), dim=-1).mean()) \
+                    + (1 - F.cosine_similarity(
+                           G, U.detach(), dim=-1).mean()) \
+                    + (1 - F.cosine_similarity(
+                           Hy, V.detach(), dim=-1).mean())
+                self.last_latent_loss = float(lat.detach())
+                loss = loss + cfg.latent_coef * lat
         return logits, loss
 
     def _aux_block(self, P, idx):
@@ -423,11 +547,20 @@ class HierGPT(nn.Module):
                + sum(p.numel() for p in self.cond_proj.parameters()))
         blk = (stack_params(self.transformer.blockpred)
                + sum(p.numel() for p in self.memory.parameters())
-               + self.w_summary.weight.numel()
+               + (sum(p.numel() for p in self.pool_blk.parameters())
+                  if cfg.levels == 3
+                  else self.w_summary.weight.numel())
                + self.w_block_in.weight.numel()
                + self.w_cond_g.weight.numel())
-        sup = (stack_params(self.transformer.superpred)
-               + self.w_super.weight.numel())
+        sup = stack_params(self.transformer.superpred)
+        hyp = 0.0
+        if cfg.levels == 3:
+            sup += sum(p.numel() for p in self.pool_sup.parameters())
+            hyp = (stack_params(self.transformer.hyperpred)
+                   + sum(p.numel() for p in self.pool_hyp.parameters())
+                   + self.w_cond_hy.weight.numel())
+        else:
+            sup += self.w_super.weight.numel()
         head = self.lm_head.weight.numel() + self.w_c.weight.numel()
         # aux heads run once per block/super (train-time compute, but
         # the matching currency is the training graph)
@@ -438,6 +571,12 @@ class HierGPT(nn.Module):
         f = 6 * (tok + head)
         f += 6 * (blk + aux_blk) / cfg.btok              # once per block
         f += 6 * (sup + aux_sup) / (cfg.btok * cfg.blocks_per_super)
+        if cfg.levels == 3:
+            f += 6 * hyp / (cfg.btok * cfg.blocks_per_super
+                            * cfg.supers_per_hyper)
+            f += (12 * cfg.d_hyp * cfg.n_hypers() * cfg.n_hyperpred
+                  / (cfg.btok * cfg.blocks_per_super
+                     * cfg.supers_per_hyper))
         # attention scores, project convention (12*d*keys, causal 1/2
         # folded into the constant exactly as core/model.py does)
         layers_tok = cfg.n_analysis + cfg.n_predict
@@ -460,7 +599,8 @@ class HierGPT(nn.Module):
         if opt == "muon":
             from core.muon import Muon, ComboOptimizer
             stacks = ("transformer.analysis.", "transformer.predict.",
-                      "transformer.blockpred.", "transformer.superpred.")
+                      "transformer.blockpred.", "transformer.superpred.",
+                      "transformer.hyperpred.")
             hidden = [p for n, p in params
                       if p.dim() == 2 and n.startswith(stacks)]
             hid_ids = {id(p) for p in hidden}
@@ -485,7 +625,11 @@ class HierGPT(nn.Module):
             lr=lr, betas=betas, fused=fused)
 
     def memory_stats(self):
-        return self.memory.last_stats or {}
+        stats = dict(self.memory.last_stats or {})
+        stats.update(getattr(self, "latent_stats", {}))
+        if hasattr(self, "last_latent_loss"):
+            stats["latent/loss"] = self.last_latent_loss
+        return stats
 
 
 def hier_config_dict(cfg: HierConfig):
