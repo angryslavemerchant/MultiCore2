@@ -116,11 +116,17 @@ def main():
                    n_params=len(worst), thresh=thresh,
                    worst=[(round(c, 6), n) for c, n in worst[:8]])
 
-    need_alive = ("memory.values.weight", "memory.keys_a",
+    need_alive = ["memory.values.weight", "memory.keys_a",
                   "memory.keys_b", "memory.wq.weight", "mem_gate",
-                  "w_summary.weight", "w_super.weight", "w_c.weight",
-                  "w_aux_blk.weight", "w_aux_sup.weight",
-                  "block_bos", "super_bos", "cond_gate")
+                  "w_c.weight", "w_aux_blk.weight", "w_aux_sup.weight",
+                  "block_bos", "super_bos"]
+    if args.levels == 3:
+        need_alive += ["pool_blk.q", "pool_sup.q", "pool_hyp.q",
+                       "hyper_bos", "w_cond_hy.weight",
+                       "cond_dyn.0.weight", "cond_dyn.0.bias"]
+    else:
+        need_alive += ["w_summary.weight", "w_super.weight",
+                       "cond_gate"]
     dead = [n for n in need_alive
             if n not in g_e or g_e[n].norm() == 0]
     ok_all &= emit("new_machinery_grads_alive", ok=not dead, dead=dead)
