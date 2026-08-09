@@ -120,13 +120,20 @@ def build_nlchain_trial(tok, rng, hops):
 
 @torch.no_grad()
 def run_task(model, tok, build, trials, device, seed):
-    def lp_last(rows):
+    def lp_last(rows, bs=96):
+        # microbatched: the full (N, L, 50304) logits tensor OOMs at
+        # fp32 x 512 trials; only the last position is ever used
         L = max(len(r) for r in rows)
-        x = torch.zeros(len(rows), L, dtype=torch.long, device=device)
-        for i, r in enumerate(rows):        # LEFT-pad so query is last
-            x[i, L - len(r):] = torch.tensor(r, device=device)
-        logits, _ = model(x, x)
-        return torch.log_softmax(logits[:, -1, :].float(), dim=-1), L
+        outs = []
+        for s in range(0, len(rows), bs):
+            chunk = rows[s:s + bs]
+            x = torch.zeros(len(chunk), L, dtype=torch.long, device=device)
+            for i, r in enumerate(chunk):   # LEFT-pad so query is last
+                x[i, L - len(r):] = torch.tensor(r, device=device)
+            logits, _ = model(x, x)
+            outs.append(torch.log_softmax(logits[:, -1, :].float(), dim=-1))
+            del logits
+        return torch.cat(outs), L
 
     out = {}
     for hops in HOPS:
