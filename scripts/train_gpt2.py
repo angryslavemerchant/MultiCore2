@@ -49,6 +49,12 @@ def parse_args():
     ap.add_argument("--run-name", default=None,
                     help="default: <scale>-<block>-<attn>-<mlp>")
     ap.add_argument("--scale", default="124m", choices=sorted(SCALES))
+    ap.add_argument("--arch", default="gpt2", choices=("gpt2", "hier"),
+                    help="hier = hierarchical predictive-plan model with "
+                         "block-level product-key memory (core/hier.py); "
+                         "ignores the attention-pattern/hourglass flags")
+    ap.add_argument("--mem-slots", type=int, default=16384,
+                    help="hier: product-key memory slots (must be square)")
     ap.add_argument("--block", default="gpt2")
     ap.add_argument("--attn", default="causal")
     ap.add_argument("--mlp", default="gelu")
@@ -192,7 +198,10 @@ def parse_args():
     if args.hg_frac:
         assert args.hg_dbase, "--hg-dbase required with --hg-frac"
     if args.run_name is None:
-        if args.hg_frac:
+        if args.arch == "hier":
+            args.run_name = (f"{args.scale}-hier-b128x32-sb8"
+                             f"-mem{args.mem_slots // 1024}k")
+        elif args.hg_frac:
             args.run_name = (f"{args.scale}-hg-f{args.hg_frac}"
                              f"-b{args.hg_bneck}"
                              + (f"-m{args.hg_mid}" if args.hg_mid else "")
@@ -277,7 +286,17 @@ def main():
                     softcap=args.softcap, untied=args.untied,
                     zero_init=args.zero_init, bias=not args.no_bias,
                     **scale)
-    model = GPT(cfg).to(device)
+    if args.arch == "hier":
+        from core.hier import HierGPT, HierConfig, hier_config_dict
+        assert args.seq_len == 4096, "hier run-one is specced at T=4096"
+        cfg = HierConfig(block_size=args.seq_len, vocab_size=VOCAB_SIZE,
+                         mem_slots=args.mem_slots, softcap=args.softcap,
+                         dropout=args.dropout)
+        model = HierGPT(cfg).to(device)
+        cfg_to_dict = hier_config_dict
+    else:
+        model = GPT(cfg).to(device)
+        cfg_to_dict = config_dict
     n_params = model.num_params()
     fpt = model.flops_per_token(args.seq_len)
 
@@ -317,9 +336,9 @@ def main():
     ckpt = None
     if args.resume and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
-        assert ckpt["config"] == config_dict(cfg), (
+        assert ckpt["config"] == cfg_to_dict(cfg), (
             "checkpoint config != requested config; refusing to resume "
-            f"{ckpt['config']} as {config_dict(cfg)}")
+            f"{ckpt['config']} as {cfg_to_dict(cfg)}")
         model.load_state_dict(ckpt["model"])
         start_step = ckpt["step"]
         best_val = ckpt.get("best_val", float("inf"))
@@ -389,7 +408,7 @@ def main():
                    name=args.run_name,
                    id=os.environ.get("WANDB_RUN_ID"),
                    resume="allow",
-                   config={**vars(args), **config_dict(cfg),
+                   config={**vars(args), **cfg_to_dict(cfg),
                            "n_params": n_params, "flops_per_token": fpt,
                            "world_size": world, "iters": iters,
                            "tokens_per_step": tokens_per_step})
@@ -409,7 +428,8 @@ def main():
         panels plus per-position-bucket loss."""
         from torch.nn import functional as F
         from core.gated_swa import GatedSWAttention
-        gated = [(i, blk.attn) for i, blk in enumerate(raw_model.transformer.h)
+        layers = getattr(raw_model.transformer, "h", [])
+        gated = [(i, blk.attn) for i, blk in enumerate(layers)
                  if isinstance(blk.attn, GatedSWAttention)]
         raw_model.eval()
         tok_sum = torch.zeros(len(BUCKETS) - 1, dtype=torch.float64)
@@ -442,6 +462,9 @@ def main():
             stats[f"gates/L{i}/entropy"] = s["router_entropy"]
             stats[f"gates/L{i}/mean_lifetime"] = s["mean_lifetime"]
             stats[f"gates/L{i}/frac_evicted"] = s["frac_evicted"]
+        if hasattr(raw_model, "memory_stats"):
+            stats.update(raw_model.memory_stats())
+            stats["mem/gate"] = float(raw_model.mem_gate.detach())
         raw_model.train()
         return float(tok_sum.sum() / tok_cnt.sum()), stats
 
@@ -450,7 +473,7 @@ def main():
         torch.save({"model": raw_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "step": step, "best_val": best,
-                    "config": config_dict(cfg), "args": vars(args),
+                    "config": cfg_to_dict(cfg), "args": vars(args),
                     "tokens": step * tokens_per_step,
                     "flops": step * tokens_per_step * fpt},
                    ckpt_path)
@@ -537,7 +560,7 @@ def main():
                            "tokens": done * tokens_per_step,
                            "flops": done * tokens_per_step * fpt,
                            "n_params": n_params,
-                           "config": config_dict(cfg)}, f, indent=2)
+                           "config": cfg_to_dict(cfg)}, f, indent=2)
             if use_wandb:
                 import wandb
                 wandb.log({"val/loss": vl, "val/best": best_val,
