@@ -112,6 +112,10 @@ def parse_args():
     ap.add_argument("--side-topk", type=int, default=16,
                     help="T layers (top-k side-stack): per-head k slices "
                          "fed to the branch in the MLP slot")
+    ap.add_argument("--loops", default="",
+                    help="uberloop: per-layer weight-tied loop counts, "
+                         "comma-separated, one per layer (e.g. "
+                         "1,1,1,2,2,4,4,4,4,2,1,1). Empty = no looping")
     ap.add_argument("--cow-chunk", type=int, default=128,
                     help="C layers: chain-scan chunk (heads frozen within)")
     # Frankenstein stack (all default off; see core/model.py)
@@ -213,6 +217,8 @@ def parse_args():
                                     or "R" in args.attn_pattern) else ""))
         else:
             args.run_name = f"{args.scale}-{args.block}-{args.attn}-{args.mlp}"
+        if args.loops:
+            args.run_name += "-L" + args.loops.replace(",", "")
         if args.pos == "rope":
             args.run_name += "-rope"
         if args.seq_len != 1024:
@@ -264,7 +270,7 @@ def main():
                     chunk_btok=args.chunk_btok, chunk_k=args.chunk_k,
                     chunk_topk=args.chunk_topk,
                     chunk_fetch_n=args.chunk_fetch_n,
-                    side_topk=args.side_topk,
+                    side_topk=args.side_topk, loops=args.loops,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

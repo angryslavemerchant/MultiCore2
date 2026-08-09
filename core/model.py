@@ -103,6 +103,18 @@ class GPTConfig:
     # attention whose MLP slot is replaced by a small transformer over the
     # per-head top-k retrieved v slices. This is the per-head k.
     side_topk: int = 16
+    # Uberloop (2026-08-09): per-layer weight-tied loop counts, comma-
+    # separated, one entry per layer ("1,1,1,2,2,4,4,4,4,2,1,1"). A layer
+    # with count L runs its block L times per forward (shared weights);
+    # symmetry across iterations is broken by per-iteration channel gains
+    # on the block input (equivalent to iteration-specific norm gains
+    # under rms) and channel scales on the residual delta, both init 1 —
+    # the consensus-cheap fix (MobileLLM needs none at 2x; Relaxed
+    # Recursive Transformers' LoRA reserved for whole-model recursion).
+    # Empty = every layer once. Loops buy re-query cadence where width is
+    # cheap: iterations cost ~w^2 so 4x at the waist is ~1/3 of one
+    # full-width layer.
+    loops: str = ""
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
@@ -139,6 +151,17 @@ class GPTConfig:
         return (ws[:self.hg_bneck]
                 + [ws[self.hg_bneck - 1]] * self.hg_mid
                 + ws[self.hg_bneck:])
+
+    def layer_loops(self):
+        """Per-layer loop counts from cfg.loops; empty = all 1."""
+        if not self.loops:
+            return [1] * self.n_layer_total()
+        parts = [int(p) for p in self.loops.split(",")]
+        assert len(parts) == self.n_layer_total(), (
+            f"loops {self.loops!r} has {len(parts)} entries for "
+            f"{self.n_layer_total()} layers")
+        assert all(p >= 1 for p in parts), self.loops
+        return parts
 
     def layer_attns(self):
         """Per-layer ATTENTIONS keys, resolving attn_pattern."""
@@ -330,6 +353,40 @@ class SliceBlock(nn.Module):
                           x[..., self.width:]), dim=-1)
 
 
+class LoopedBlock(nn.Module):
+    """Uberloop: run one weight-tied block `loops` times. Per-iteration
+    channel gain g_i on the block input and channel scale s_i on the
+    residual delta (both init 1) break iteration symmetry without
+    adapters: under rms norms an input channel gain IS an
+    iteration-specific norm gain (rms divides by the whole-vector norm,
+    so relative channel weights pass through), and iteration i computes
+    x <- x + s_i * (block(g_i * x) - g_i * x), which at init (g=s=1)
+    is exactly block(x). For SliceBlocks the delta is zero on carry
+    dims, so gains there are inert and the carry stream is never
+    rescaled. Gains live in a ParameterList (1D each) so Muon's
+    2D-under-h rule leaves them to AdamW."""
+
+    def __init__(self, block, loops, dim):
+        super().__init__()
+        assert loops >= 2, loops
+        self.block = block
+        self.loops = loops
+        self.gains = nn.ParameterList(
+            nn.Parameter(torch.ones(dim)) for _ in range(loops))
+        self.scales = nn.ParameterList(
+            nn.Parameter(torch.ones(dim)) for _ in range(loops))
+
+    @property
+    def attn(self):
+        return self.block.attn
+
+    def forward(self, x):
+        for g, s in zip(self.gains, self.scales):
+            u = x * g
+            x = x + s * (self.block(u) - u)
+        return x
+
+
 from core.gated_swa import SlidingWindowAttention, GatedSWAttention  # noqa: E402
 from core.cow import COWAttention  # noqa: E402
 from core.chunk import ChunkAttention, BlockSumAttention  # noqa: E402
@@ -363,19 +420,22 @@ class GPT(nn.Module):
         super().__init__()
         assert cfg.pos in ("learned", "rope"), cfg.pos
         self.cfg = cfg
+        def build(key, w, win, lp):
+            lcfg = (cfg if win is None or win == cfg.window
+                    else replace(cfg, window=win))
+            b = (make_block(lcfg, key) if w == cfg.n_embd
+                 else SliceBlock(lcfg, key, w))
+            return LoopedBlock(b, lp, cfg.n_embd) if lp > 1 else b
+
         modules = dict(
             wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
             h=nn.ModuleList(
-                make_block(lcfg, key) if w == cfg.n_embd
-                else SliceBlock(lcfg, key, w)
-                for key, w, lcfg in (
-                    (key, w,
-                     cfg if win is None or win == cfg.window
-                     else replace(cfg, window=win))
-                    for key, w, win in zip(cfg.layer_attns(),
+                build(key, w, win, lp)
+                for key, w, win, lp in zip(cfg.layer_attns(),
                                            cfg.layer_widths(),
-                                           cfg.layer_windows()))),
+                                           cfg.layer_windows(),
+                                           cfg.layer_loops())),
             ln_f=make_norm(cfg, cfg.n_embd),
         )
         if cfg.pos == "learned":
@@ -491,13 +551,21 @@ class GPT(nn.Module):
             T, self.cfg.chunk_btok, self.cfg.chunk_k,
             self.cfg.chunk_topk, self.cfg.chunk_fetch_n)
         # hourglass layers score at their own (narrower) width; windowed
-        # layers at their own (per-layer, cfg.windows) window
-        score = sum(12 * w * (T if win is None
-                              else cow_keys if k == "cow"
-                              else avg_keys(win) + chunk_keys.get(k, 0.0))
-                    for k, w, win in zip(self.cfg.layer_attns(),
-                                         self.cfg.layer_widths(),
-                                         self.cfg.layer_windows()))
+        # layers at their own (per-layer, cfg.windows) window; looped
+        # layers score once per iteration
+        score = sum(lp * 12 * w * (T if win is None
+                                   else cow_keys if k == "cow"
+                                   else avg_keys(win) + chunk_keys.get(k, 0.0))
+                    for k, w, win, lp in zip(self.cfg.layer_attns(),
+                                             self.cfg.layer_widths(),
+                                             self.cfg.layer_windows(),
+                                             self.cfg.layer_loops()))
+        # uberloop: each extra iteration re-spends the layer's matmul
+        # FLOPs on weight-tied params that 6*N bills only once
+        score += sum(6 * (lp - 1)
+                     * sum(p.numel() for p in blk.block.parameters())
+                     for lp, blk in zip(self.cfg.layer_loops(),
+                                        self.transformer.h) if lp > 1)
         if self.cfg.diff_attn:
             # two half-width score passes (parity) but both attention maps
             # hit the full value width: value application doubles -> 1.5x
