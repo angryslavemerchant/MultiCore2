@@ -376,15 +376,20 @@ def main():
                         and not any(c in args.attn_pattern for c in "GCKBN")
                         and torch.cuda.is_available()
                         and _gsw._resolve_flash() is not None)
-        if ddp and not flash_covers and (
-                args.diff_attn
-                or any(c in args.attn_pattern for c in "GSCKBN")):
+        if ddp and (args.arch == "hier"
+                    or (not flash_covers
+                        and (args.diff_attn
+                             or any(c in args.attn_pattern
+                                    for c in "GSCKBN")))):
             # DDPOptimizer's graph-splitting chokes on flex_attention's
             # higher-order op inside the franken graph shape ("'int'
             # object has no attribute 'meta'", 2026-07-30: single-process
             # trains, DDP crashes — with or without diff attention or
-            # flex kernel_options). Compile the whole graph instead;
-            # costs the backward/allreduce overlap (~few % at 124M).
+            # flex kernel_options). The hier arch trips the same splitter
+            # failure through its PKM/aux graph (2026-08-09: single-GPU
+            # compiles, 8x DDP crashes with the identical message).
+            # Compile the whole graph instead; costs the
+            # backward/allreduce overlap (~few % at 124M).
             torch._dynamo.config.optimize_ddp = False
         model = torch.compile(model)
     raw_model = model._orig_mod if compile_ok else model
