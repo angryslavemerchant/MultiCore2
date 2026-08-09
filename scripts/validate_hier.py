@@ -51,6 +51,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--token-mode", default="block",
                     choices=("block", "swa"))
+    ap.add_argument("--levels", type=int, default=2, choices=(2, 3))
+    ap.add_argument("--btok", type=int, default=128)
     ap.add_argument("--fp32", action="store_true")
     ap.add_argument("--cos-thresh", type=float, default=None)
     ap.add_argument("--skip-timing", action="store_true")
@@ -61,7 +63,8 @@ def main():
         if hasattr(torch._dynamo.config, attr):
             setattr(torch._dynamo.config, attr, 64)
 
-    cfg = HierConfig(token_mode=args.token_mode)
+    cfg = HierConfig(token_mode=args.token_mode, levels=args.levels,
+                     btok=args.btok)
     model = HierGPT(cfg).cuda()
     with torch.no_grad():
         model.lm_head.weight.normal_(0, 0.02)
