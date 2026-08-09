@@ -55,6 +55,11 @@ def parse_args():
                          "ignores the attention-pattern/hourglass flags")
     ap.add_argument("--mem-slots", type=int, default=16384,
                     help="hier: product-key memory slots (must be square)")
+    ap.add_argument("--token-mode", default="block",
+                    choices=("block", "swa"),
+                    help="hier token stacks: independent 128-windows "
+                         "(block) or true w128 sliding window over the "
+                         "full sequence (swa, NSA-style)")
     ap.add_argument("--block", default="gpt2")
     ap.add_argument("--attn", default="causal")
     ap.add_argument("--mlp", default="gelu")
@@ -200,7 +205,9 @@ def parse_args():
     if args.run_name is None:
         if args.arch == "hier":
             args.run_name = (f"{args.scale}-hier-b128x32-sb8"
-                             f"-mem{args.mem_slots // 1024}k")
+                             f"-mem{args.mem_slots // 1024}k"
+                             + ("-swa" if args.token_mode == "swa"
+                                else ""))
         elif args.hg_frac:
             args.run_name = (f"{args.scale}-hg-f{args.hg_frac}"
                              f"-b{args.hg_bneck}"
@@ -291,7 +298,8 @@ def main():
         assert args.seq_len == 4096, "hier run-one is specced at T=4096"
         cfg = HierConfig(block_size=args.seq_len, vocab_size=VOCAB_SIZE,
                          mem_slots=args.mem_slots, softcap=args.softcap,
-                         dropout=args.dropout)
+                         dropout=args.dropout,
+                         token_mode=args.token_mode)
         model = HierGPT(cfg).to(device)
         cfg_to_dict = hier_config_dict
     else:

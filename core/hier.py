@@ -75,6 +75,14 @@ class HierConfig:
     aux_block_coef: float = 0.10
     aux_super_coef: float = 0.05
     route_coef: float = 0.01
+    # token-stack attention mode:
+    #   "block" = independent 128-token windows (run one; block-diagonal,
+    #             cold boundaries -- the no-overlap ablation)
+    #   "swa"   = true sliding window w128 over the full sequence (every
+    #             token sees its trailing 127; stacked layers compound
+    #             reach; NSA-style: window + plan + sparse branches).
+    #             Summaries still mint every btok tokens.
+    token_mode: str = "block"
     # recipe
     softcap: float = 15.0
     dropout: float = 0.0
@@ -94,14 +102,16 @@ class HierConfig:
         return n
 
 
-def _stack_cfg(cfg, d, n_layer, n_head, T, canon):
+def _stack_cfg(cfg, d, n_layer, n_head, T, canon, window=0):
     """A GPTConfig for one internal transformer stack (reuses the
-    project's Block / CausalSelfAttention with rope + qk-norm)."""
+    project's Block / CausalSelfAttention / SlidingWindowAttention
+    with rope + qk-norm). window > 0 selects the SWA attention."""
     return GPTConfig(block_size=T, vocab_size=1, n_layer=n_layer,
                      n_head=n_head, n_embd=d, dropout=cfg.dropout,
                      bias=False, pos="rope", norm="rms", mlp="relu2",
                      qk_norm=True, canon=canon, canon_full=canon,
-                     untied=True, zero_init=True)
+                     untied=True, zero_init=True,
+                     window=window or 512)
 
 
 class ProductKeyMemory(nn.Module):
@@ -177,19 +187,23 @@ class HierGPT(nn.Module):
         NB, NS = cfg.n_blocks(), cfg.n_supers()
         tok_T = cfg.btok
 
-        def stack(d, layers, heads, T, canon):
-            scfg = _stack_cfg(cfg, d, layers, heads, T, canon)
-            return nn.ModuleList(make_block(scfg, "causal")
+        def stack(d, layers, heads, T, canon, key="causal", window=0):
+            scfg = _stack_cfg(cfg, d, layers, heads, T, canon, window)
+            return nn.ModuleList(make_block(scfg, key)
                                  for _ in range(layers))
 
+        swa = cfg.token_mode == "swa"
+        tok_key = "swa" if swa else "causal"
+        tok_len = cfg.block_size if swa else tok_T
+        tok_win = cfg.btok if swa else 0
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(cfg.vocab_size, cfg.d_tok),
             analysis=nn.ModuleList(
                 stack(cfg.d_tok, cfg.n_analysis, cfg.n_head_tok,
-                      tok_T, True)),
+                      tok_len, True, tok_key, tok_win)),
             predict=nn.ModuleList(
                 stack(cfg.d_tok, cfg.n_predict, cfg.n_head_tok,
-                      tok_T, True)),
+                      tok_len, True, tok_key, tok_win)),
             blockpred=nn.ModuleList(
                 stack(cfg.d_blk, cfg.n_blockpred, cfg.n_head_blk,
                       NB, False)),
@@ -256,16 +270,25 @@ class HierGPT(nn.Module):
         B, T = idx.shape
         NB = T // cfg.btok
         x = self.transformer.wte(idx)                   # (B,T,768)
-        h = x.view(B * NB, cfg.btok, cfg.d_tok)
+        if cfg.token_mode == "swa":
+            h = x                                       # full sequence
+        else:
+            h = x.view(B * NB, cfg.btok, cfg.d_tok)
         for blk in self.transformer.analysis:
             h = blk(h)
-        return h                                        # (B*NB,128,768)
+        return h            # (B,T,768) swa | (B*NB,128,768) block
 
     def _summaries(self, h, B):
         cfg = self.cfg
-        NB = h.shape[0] // B
-        core = torch.cat((h.mean(dim=1), h[:, -1]), dim=-1)
-        S = self.ln_summary(self.w_summary(core)).view(B, NB, cfg.d_blk)
+        if cfg.token_mode == "swa":
+            hb = h.view(B, -1, cfg.btok, cfg.d_tok)     # (B,NB,128,768)
+            core = torch.cat((hb.mean(dim=2), hb[:, :, -1]), dim=-1)
+            S = self.ln_summary(self.w_summary(core))   # (B,NB,512)
+        else:
+            NB = h.shape[0] // B
+            core = torch.cat((h.mean(dim=1), h[:, -1]), dim=-1)
+            S = self.ln_summary(
+                self.w_summary(core)).view(B, NB, cfg.d_blk)
         g = S.view(B, cfg.n_supers(), cfg.blocks_per_super, cfg.d_blk)
         U = self.ln_super(self.w_super(
             torch.cat((g.mean(dim=2), g[:, :, -1]), dim=-1)))
@@ -303,15 +326,25 @@ class HierGPT(nn.Module):
         NB = T // cfg.btok
         g_per_block = G.unsqueeze(2).expand(
             -1, -1, cfg.blocks_per_super, -1).reshape(B, NB, cfg.d_sup)
-        C = self.w_c(torch.cat((P, g_per_block), dim=-1))
-        C = C.view(B * NB, 1, cfg.d_tok)
+        C = self.w_c(torch.cat((P, g_per_block), dim=-1))  # (B,NB,768)
         x = self.transformer.wte(idx)
+        if cfg.token_mode == "swa":
+            h = x                                       # (B,T,768)
+            for i, blk in enumerate(self.transformer.predict):
+                h = blk(h)
+                if not self.disable_cond:
+                    ci = self.cond_proj[i](C)           # per-block GEMM
+                    h = h + torch.sigmoid(self.cond_gate[i]) \
+                        * ci.repeat_interleave(cfg.btok, dim=1)
+            h = self.transformer.ln_f(h)
+            return h
+        Cw = C.view(B * NB, 1, cfg.d_tok)
         h = x.view(B * NB, cfg.btok, cfg.d_tok)
         for i, blk in enumerate(self.transformer.predict):
             h = blk(h)
             if not self.disable_cond:
                 h = h + torch.sigmoid(self.cond_gate[i]) \
-                    * self.cond_proj[i](C)
+                    * self.cond_proj[i](Cw)
         h = self.transformer.ln_f(h)
         return h.view(B, T, cfg.d_tok)
 
@@ -408,7 +441,12 @@ class HierGPT(nn.Module):
         # attention scores, project convention (12*d*keys, causal 1/2
         # folded into the constant exactly as core/model.py does)
         layers_tok = cfg.n_analysis + cfg.n_predict
-        f += 12 * cfg.d_tok * cfg.btok * layers_tok
+        if cfg.token_mode == "swa":
+            w = cfg.btok
+            avg = (w * (w + 1) / 2 + (T - w) * w) / T
+            f += 12 * cfg.d_tok * avg * layers_tok
+        else:
+            f += 12 * cfg.d_tok * cfg.btok * layers_tok
         f += 12 * cfg.d_blk * cfg.n_blocks() * cfg.n_blockpred / cfg.btok
         f += (12 * cfg.d_sup * cfg.n_supers() * cfg.n_superpred
               / (cfg.btok * cfg.blocks_per_super))

@@ -236,3 +236,58 @@ def test_flops_and_params_sane():
     assert 90e6 < n < 135e6, n
     f = m.flops_per_token()
     assert 0.3e9 < f < 1.5e9, f
+
+
+# ------------------------------------------------------------- swa mode
+
+def test_swa_mode_cross_boundary_visibility():
+    # a token just after a block boundary must SEE the previous block's
+    # raw tokens (the whole point of swa mode vs block mode)
+    torch.manual_seed(0)
+    cfg = tiny(token_mode="swa")
+    m = randomize_zero_inits(HierGPT(cfg)).eval()
+    idx = torch.randint(0, 256, (1, 512))
+    base = logits_of(m, idx)
+    pert = idx.clone()
+    pert[0, 60] = (pert[0, 60] + 1) % 256      # near end of block 0
+    after = logits_of(m, pert)
+    # position 65 (block 1) is within w=64 of position 60: must change
+    assert not torch.equal(base[0, 65], after[0, 65])
+    # and causality: positions before 60 unchanged
+    assert torch.equal(base[0, :60], after[0, :60])
+
+
+def test_swa_mode_plans_still_blockwise_causal():
+    torch.manual_seed(0)
+    cfg = tiny(token_mode="swa")
+    m = randomize_zero_inits(HierGPT(cfg)).eval()
+    idx = torch.randint(0, 256, (1, 512))
+    with torch.no_grad():
+        H = m._analyze(idx)
+        S, U = m._summaries(H, 1)
+        P, _ = m._plans(S, U)
+        pert = idx.clone()
+        pert[0, 192:256] = (pert[0, 192:256] + 1) % 256   # block 3
+        H2 = m._analyze(pert)
+        S2, U2 = m._summaries(H2, 1)
+        P2, _ = m._plans(S2, U2)
+    # swa reach backward: only blocks whose WINDOWS see block 3 change;
+    # plans for blocks 0..3 use S_{<b} of untouched-or-earlier blocks.
+    # P_0..P_3 depend on S_0..S_2; S_2's tokens can't see block 3
+    # (future) -> unchanged
+    assert torch.equal(P[:, :4], P2[:, :4])
+    assert not torch.equal(P[:, 4], P2[:, 4])
+
+
+def test_swa_mode_loss_and_shapes():
+    torch.manual_seed(0)
+    cfg = tiny(token_mode="swa")
+    m = randomize_zero_inits(HierGPT(cfg))
+    idx = torch.randint(0, 256, (2, 512))
+    m.train()
+    lg, loss = m(idx, idx.roll(-1, dims=1))
+    assert lg.shape == (2, 512, 256)
+    assert loss.isfinite()
+    loss.backward()
+    p = dict(m.named_parameters())["memory.values.weight"]
+    assert p.grad is not None and p.grad.abs().sum() > 0
