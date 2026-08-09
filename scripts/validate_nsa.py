@@ -1,6 +1,7 @@
 """On-GPU gate for the NSA-with-registers arm (core/nsa.py).
 
-Real run config: T=4096, hourglass d1080 f0.2 b8 r24, window 128,
+Real run config: T=4096, hourglass d1080 f0.2 b8 r96 (r96 keeps every
+head_dim a multiple of 8 — xformers flash requirement), window 128,
 nsa 32-blocks / top-12 / 1024 registers, speedrun stack. Checks:
   1. causality perturbation (eager): change tokens from position s on
      -> logits before s bitwise-unchanged (mid-block + block edge);
@@ -36,7 +37,7 @@ def real_cfg(args):
                      attn="nsa", mlp="relu2", norm="rms", qk_norm=True,
                      pos="rope", untied=True, zero_init=True,
                      softcap=15, canon=True, window=args.window,
-                     hg_frac=0.2, hg_bneck=8, hg_round=24,
+                     hg_frac=0.2, hg_bneck=8, hg_round=96,
                      nsa_block=args.nsa_block, nsa_topk=args.nsa_topk,
                      nsa_nreg=args.nsa_nreg)
 
