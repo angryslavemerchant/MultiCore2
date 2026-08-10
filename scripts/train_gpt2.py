@@ -406,7 +406,7 @@ def main():
                         and not any(c in args.attn_pattern for c in "GCKBN")
                         and torch.cuda.is_available()
                         and _gsw._resolve_flash() is not None)
-        if ddp and (args.arch == "hier"
+        if ddp and (args.arch == "hier" or args.attn == "nsa"
                     or (not flash_covers
                         and (args.diff_attn
                              or any(c in args.attn_pattern
@@ -418,6 +418,10 @@ def main():
             # flex kernel_options). The hier arch trips the same splitter
             # failure through its PKM/aux graph (2026-08-09: single-GPU
             # compiles, 8x DDP crashes with the identical message).
+            # NSA NaNs under DDP graph splits (2026-08-09: single-GPU
+            # compiled trains clean 10.8->0.46 in 30 steps, 8x DDP loss
+            # is nan by step 10) — silent-corruption cousin of the same
+            # splitter, so whole-graph compile for nsa too.
             # Compile the whole graph instead; costs the
             # backward/allreduce overlap (~few % at 124M).
             torch._dynamo.config.optimize_ddp = False
