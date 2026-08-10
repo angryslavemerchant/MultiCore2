@@ -190,11 +190,13 @@ def main():
         name = name.strip()
         ckpt = torch.load(os.path.join("runs", name, args.ckpt),
                           map_location=device)
-        cfg = GPTConfig(**ckpt["config"])
-        model = GPT(cfg).to(device).eval()
+        from core.model import model_from_ckpt_config
+        cfg, model = model_from_ckpt_config(ckpt["config"])
+        model = model.to(device).eval()
         model.load_state_dict(ckpt["model"])
-        print(f"[reason] {name} (pattern {cfg.attn_pattern}, "
-              f"loops {cfg.loops or 'none'})", flush=True)
+        print(f"[reason] {name} (pattern "
+              f"{getattr(cfg, 'attn_pattern', cfg.__class__.__name__)}, "
+              f"loops {getattr(cfg, 'loops', '') or 'none'})", flush=True)
         res = {}
         for task, build in (("chain", build_chain_trial),
                             ("nlchain", build_nlchain_trial)):

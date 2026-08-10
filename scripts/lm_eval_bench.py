@@ -32,9 +32,13 @@ def build_lm(ckpt_path, device, batch_size):
     from lm_eval.api.instance import Instance
     from transformers import AutoTokenizer
 
+    from core.model import model_from_ckpt_config
     ckpt = torch.load(ckpt_path, map_location=device)
-    cfg = GPTConfig(**ckpt["config"])
-    model = GPT(cfg).to(device).eval()
+    cfg, model = model_from_ckpt_config(ckpt["config"])
+    model = model.to(device).eval()
+    # hier needs T % btok == 0; nsa needs T % nsa_block == 0
+    mult = (cfg.btok if hasattr(cfg, "btok")
+            else cfg.nsa_block if cfg.attn == "nsa" else 1)
     # v0-era chunk checkpoints predate the v0.1 writer gain (init 1.0 ==
     # the exact soft behavior they trained with) — tolerate ONLY that
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
@@ -42,9 +46,18 @@ def build_lm(ckpt_path, device, batch_size):
     assert all(m.endswith(".gain") for m in missing), missing
     tok = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     T = cfg.block_size
+
+    def pad_len(n):
+        """Right-pad length n up to a multiple of `mult` (causal-safe:
+        trailing pads cannot influence earlier positions in any arm —
+        swa/cmp/slc are strictly causal and hier summaries of pad-only
+        blocks are never read by real queries)."""
+        return n if mult == 1 else -(-n // mult) * mult
+
     print(f"loaded {ckpt_path}: step {ckpt['step']}, "
           f"val {ckpt.get('best_val'):.4f}, pattern "
-          f"{cfg.attn_pattern or 'dense'}, block {T}")
+          f"{getattr(cfg, 'attn_pattern', '') or cfg.__class__.__name__}, "
+          f"block {T}, pad_mult {mult}")
 
     class OurLM(LM):
         def loglikelihood(self, requests):
@@ -64,7 +77,8 @@ def build_lm(ckpt_path, device, batch_size):
             with torch.no_grad():
                 for s in range(0, len(order), batch_size):
                     chunk = order[s:s + batch_size]
-                    L = max(len(prepared[i][0]) for i in chunk)
+                    L = pad_len(max(len(prepared[i][0]) for i in chunk)
+                                - 1) + 1
                     x = torch.zeros(len(chunk), L, dtype=torch.long)
                     for r, i in enumerate(chunk):
                         ids = prepared[i][0]
@@ -96,12 +110,17 @@ def build_lm(ckpt_path, device, batch_size):
                 with torch.no_grad():
                     for s in range(0, len(ids) - 1, T):
                         seg = ids[s:s + T + 1]
-                        x = torch.tensor(seg[:-1])[None].to(device)
-                        y = torch.tensor(seg[1:])[None].to(device)
+                        n = len(seg) - 1
+                        pad = pad_len(n) - n
+                        xs = seg[:-1] + [0] * pad
+                        ys = seg[1:] + [0] * pad
+                        x = torch.tensor(xs)[None].to(device)
+                        y = torch.tensor(ys)[None].to(device)
                         logits, _ = model(x, y)
                         lp = torch.log_softmax(logits.float(), -1)
                         total += float(
-                            lp[0].gather(-1, y[0][:, None]).sum())
+                            lp[0, :n].gather(
+                                -1, y[0, :n][:, None]).sum())
                 res.append((total,))
             return res
 

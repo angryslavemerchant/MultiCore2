@@ -658,3 +658,17 @@ class GPT(nn.Module):
 
 def config_dict(cfg: GPTConfig):
     return asdict(cfg)
+
+
+def model_from_ckpt_config(config: dict):
+    """(cfg, model) for a checkpoint's config dict, dispatching on
+    family: hier checkpoints (HierConfig fields) vs everything else.
+    Bench/probe scripts share this so new families patch one place."""
+    config = dict(config)
+    arch = config.pop("arch", None)       # hier_config_dict stamps this
+    if arch == "hier" or "btok" in config:
+        from core.hier import HierGPT, HierConfig
+        cfg = HierConfig(**config)
+        return cfg, HierGPT(cfg)
+    cfg = GPTConfig(**config)
+    return cfg, GPT(cfg)
