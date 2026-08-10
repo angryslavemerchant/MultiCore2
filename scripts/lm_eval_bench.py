@@ -36,9 +36,7 @@ def build_lm(ckpt_path, device, batch_size):
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg, model = model_from_ckpt_config(ckpt["config"])
     model = model.to(device).eval()
-    # hier needs T % btok == 0; nsa needs T % nsa_block == 0
-    mult = (cfg.btok if hasattr(cfg, "btok")
-            else cfg.nsa_block if cfg.attn == "nsa" else 1)
+    mult = 1   # length constraints handled by PadForward in the loader
     # v0-era chunk checkpoints predate the v0.1 writer gain (init 1.0 ==
     # the exact soft behavior they trained with) — tolerate ONLY that
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)

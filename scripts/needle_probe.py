@@ -168,7 +168,8 @@ def main():
     T = min(args.seq_len, cfg.block_size)
     k, m = args.needle_prefix, args.needle_payload
     dists = [d for d in DISTANCES if d + k + m + m <= T]
-    print(f"[probe] {args.run_name}: pattern {cfg.attn_pattern or 'dense'}, "
+    print(f"[probe] {args.run_name}: pattern "
+          f"{getattr(cfg, 'attn_pattern', '') or type(cfg).__name__}, "
           f"T={T}, distances {dists}, {args.trials} trials each", flush=True)
 
     corpus = ensure_corpus()

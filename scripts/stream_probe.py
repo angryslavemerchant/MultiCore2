@@ -138,7 +138,8 @@ def main():
                        h2_distances=fits(ProbeConfig.h2_distances, 2),
                        ghost_distances=fits(ProbeConfig.ghost_distances))
     print(f"[stream_probe] {args.run_name}: pattern "
-          f"{cfg.attn_pattern or 'dense'}, T={cfg.block_size}, "
+          f"{getattr(cfg, 'attn_pattern', '') or type(cfg).__name__}, "
+          f"T={cfg.block_size}, "
           f"{args.lifetimes} lifetimes, distances {pcfg.distances}",
           flush=True)
 

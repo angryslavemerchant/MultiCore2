@@ -660,15 +660,52 @@ def config_dict(cfg: GPTConfig):
     return asdict(cfg)
 
 
+class PadForward(nn.Module):
+    """Bench-time shim for arms with sequence-length constraints: right-
+    pads idx/targets to `full` (fixed length) or the next multiple of
+    `mult`, runs the inner model, and slices logits back to the caller's
+    length. Causal-safe: trailing pads cannot influence earlier
+    positions in any arm. The returned loss includes pad positions —
+    bench scripts consume logits, not loss."""
+
+    def __init__(self, model, mult=1, full=None):
+        super().__init__()
+        self.model, self.mult, self.full = model, mult, full
+
+    def load_state_dict(self, sd, strict=True):
+        return self.model.load_state_dict(sd, strict=strict)
+
+    def forward(self, idx, targets=None):
+        n = idx.shape[1]
+        tgt = self.full or -(-n // self.mult) * self.mult
+        if tgt == n:
+            return self.model(idx, targets)
+        pad = idx.new_zeros(idx.shape[0], tgt - n)
+        padded = torch.cat((idx, pad), dim=1)
+        if targets is None:
+            # inner would return only the LAST (pad!) position; force
+            # full logits with dummy targets, hand back the last REAL one
+            logits, _ = self.model(padded, padded)
+            return logits[:, n - 1:n], None
+        logits, loss = self.model(padded,
+                                  torch.cat((targets, pad), dim=1))
+        return logits[:, :n], loss
+
+
 def model_from_ckpt_config(config: dict):
     """(cfg, model) for a checkpoint's config dict, dispatching on
     family: hier checkpoints (HierConfig fields) vs everything else.
-    Bench/probe scripts share this so new families patch one place."""
+    Bench/probe scripts share this so new families patch one place.
+    Length-constrained arms come back wrapped in PadForward (hier needs
+    T == block_size exactly; nsa needs T % nsa_block == 0)."""
     config = dict(config)
     arch = config.pop("arch", None)       # hier_config_dict stamps this
     if arch == "hier" or "btok" in config:
         from core.hier import HierGPT, HierConfig
         cfg = HierConfig(**config)
-        return cfg, HierGPT(cfg)
+        return cfg, PadForward(HierGPT(cfg), full=cfg.block_size)
     cfg = GPTConfig(**config)
-    return cfg, GPT(cfg)
+    model = GPT(cfg)
+    if cfg.attn == "nsa":
+        model = PadForward(model, mult=cfg.nsa_block)
+    return cfg, model
