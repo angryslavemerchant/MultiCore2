@@ -114,3 +114,35 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print(f"PASS {name}")
+
+
+def test_disable_registers_ablation():
+    """Pseudo-ablation: flag changes outputs, keeps causality, no NaN
+    (incl. the first-block empty-row guard), stats populated."""
+    m = build().eval()
+    x = torch.randint(0, 256, (1, 64))
+    with torch.no_grad():
+        base, _ = m(x, x)
+        for blk in m.transformer.h:
+            blk.attn.disable_registers = True
+        off, _ = m(x, x)
+    assert torch.isfinite(off).all()
+    assert not torch.allclose(base, off)
+    st = m.transformer.h[0].attn.reg_stats
+    assert st["reg_sel_frac"] == 0.0          # nothing selectable
+    # causality still holds with the guard in place
+    with torch.no_grad():
+        pert = x.clone()
+        pert[0, 40:] = (pert[0, 40:] + 1) % 256
+        after, _ = m(pert, pert)
+        assert torch.equal(off[0, :40], after[0, :40])
+
+
+def test_reg_stats_live_when_enabled():
+    m = build().eval()
+    x = torch.randint(0, 256, (2, 64))
+    with torch.no_grad():
+        m(x, x)
+    st = m.transformer.h[0].attn.reg_stats
+    assert 0.0 < st["reg_cmp_mass"] <= 1.0
+    assert 0.0 <= st["reg_sel_frac"] <= 1.0

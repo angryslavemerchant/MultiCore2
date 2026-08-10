@@ -54,6 +54,13 @@ class NSARegisterAttention(SlidingWindowAttention):
             torch.empty(cfg.nsa_nreg, C).normal_(0, 0.02))
         # per-head, per-token branch gates: [swa, cmp, slc]
         self.w_gate = nn.Linear(C, 3 * cfg.n_head, bias=cfg.bias)
+        # eval-time pseudo-ablation (the hier disable_memory trick):
+        # mask register blocks out of cmp scores AND the selection pool.
+        # Set on the module post-load; never used in training.
+        self.disable_registers = False
+        # eval-time telemetry: {"reg_cmp_mass", "reg_sel_frac"} written
+        # each forward when not training (cheap; both are scalars)
+        self.reg_stats = {}
 
     def _reg_kv(self, B):
         """Project registers with this layer's K/V weights: (B,H,R,hd)."""
@@ -125,9 +132,13 @@ class NSARegisterAttention(SlidingWindowAttention):
         blk_id = torch.arange(T, device=x.device) // nb      # (T,)
         tok_ok = (torch.arange(NB, device=x.device)
                   < blk_id.unsqueeze(-1))            # (T,NB) strictly past
-        allowed = torch.cat((tok_ok.new_ones(T, NR), tok_ok), dim=1)
+        reg_ok = tok_ok.new_full((T, NR), not self.disable_registers)
+        allowed = torch.cat((reg_ok, tok_ok), dim=1)
         scores = scores.masked_fill(~allowed, float("-inf"))
         p = F.softmax(scores, dim=-1)                # (B,H,T,NR+NB)
+        if self.disable_registers:
+            # first-block queries have NO valid cmp keys -> softmax NaN
+            p = torch.nan_to_num(p, nan=0.0)
         y_cmp = p @ V_cmp
 
         # ---- branch 3: slc (top-k blocks, dense-with-mask fetch) ------
@@ -135,12 +146,31 @@ class NSARegisterAttention(SlidingWindowAttention):
         idx = sel.topk(self.topk, dim=-1).indices
         vis = torch.zeros_like(sel, dtype=torch.bool
                                ).scatter_(-1, idx, True) & allowed
+        if (not self.training
+                and not torch.compiler.is_compiling()):
+            self.reg_stats = {
+                "reg_cmp_mass": float(p[..., :NR].sum(-1).mean()),
+                # fraction of SURVIVING selections that are registers
+                # (raw topk picks zero-score fillers that vis discards)
+                "reg_sel_frac": float(vis[..., :NR].sum()
+                                      / vis.sum().clamp(min=1))}
+        empty = None
+        if self.disable_registers:
+            # rows with nothing visible (first block when registers are
+            # disabled): give them register block 0 to keep SDPA finite
+            # (registers are input-independent; output zeroed below).
+            # With registers enabled this cannot happen — no extra work
+            # on the trained/compiled path.
+            empty = ~vis.any(-1)                     # (B,T)
+            vis[..., 0] = vis[..., 0] | empty
         vis = vis.repeat_interleave(nb, dim=-1)      # (B,T,R+T)
         K_all = torch.cat((k_reg, k), dim=2)
         V_all = torch.cat((v_reg, v), dim=2)
         y_slc = F.scaled_dot_product_attention(
             q, K_all, V_all, attn_mask=vis.unsqueeze(1),
             dropout_p=dropout_p)
+        if empty is not None:
+            y_slc = y_slc * (~empty).unsqueeze(1).unsqueeze(-1)
 
         # ---- per-head sigmoid gates -----------------------------------
         g = torch.sigmoid(self.w_gate(x))            # (B,T,3H)

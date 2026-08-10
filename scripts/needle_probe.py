@@ -103,7 +103,9 @@ def payload_logprob(model, x, m, device, batch_size):
     lps, accs = [], []
     for s in range(0, len(x), batch_size):
         xb = torch.from_numpy(x[s:s + batch_size]).to(device)
-        amp = (torch.autocast(device, dtype=torch.bfloat16)
+        dt = (torch.bfloat16 if torch.cuda.is_bf16_supported()
+              else torch.float16)      # pre-Ampere eval boxes
+        amp = (torch.autocast(device, dtype=dt)
                if device == "cuda" else torch.autocast("cpu", enabled=False))
         with amp:
             logits, _ = model(xb, xb)
@@ -152,6 +154,9 @@ def main():
     ap.add_argument("--needle-payload", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--disable-registers", action="store_true",
+                    help="NSA pseudo-ablation: mask register blocks out "
+                         "of cmp + selection (writes *_noreg.json)")
     args = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -160,6 +165,16 @@ def main():
     from core.model import model_from_ckpt_config
     cfg, model = model_from_ckpt_config(ckpt["config"])
     model = model.to(device).eval()
+    if args.disable_registers:
+        from core.nsa import NSARegisterAttention
+        n = 0
+        for m in model.modules():
+            if isinstance(m, NSARegisterAttention):
+                m.disable_registers = True
+                n += 1
+        assert n, "--disable-registers on a model with no NSA layers"
+        print(f"[probe] REGISTERS DISABLED on {n} layers "
+              "(pseudo-ablation)", flush=True)
     # v0-era chunk checkpoints predate the v0.1 writer gain (init 1.0 ==
     # the exact soft behavior they trained with) — tolerate ONLY that
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
@@ -178,7 +193,9 @@ def main():
     out = {"seq_len": T, "trials": args.trials,
            "needle": {"prefix": k, "payload": m}, "seed": args.seed,
            "distances": results}
-    path = os.path.join("runs", args.run_name, "needle_probe.json")
+    fname = ("needle_probe_noreg.json" if args.disable_registers
+             else "needle_probe.json")
+    path = os.path.join("runs", args.run_name, fname)
     with open(path, "w") as f:
         json.dump(out, f, indent=2)
     print(f"wrote {path}")
