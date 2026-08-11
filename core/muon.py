@@ -21,14 +21,18 @@ import torch
 
 
 def zeropower_via_newtonschulz5(G, steps=5):
-    """Approximate UV^T for G = USV^T via quintic Newton-Schulz in bf16."""
-    assert G.ndim == 2
+    """Approximate UV^T for G = USV^T via quintic Newton-Schulz in bf16.
+    Accepts stacked matrices (..., m, n) — leading dims are batch; each
+    slice is orthogonalised independently (per-slice norm, batched
+    matmuls). This is how the four-stroke (K, d_in, d_out) machine
+    weights get true per-machine Muon without a Python loop."""
+    assert G.ndim >= 2
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.bfloat16()
-    transposed = G.size(0) > G.size(1)
+    transposed = G.size(-2) > G.size(-1)
     if transposed:
         X = X.mT
-    X = X / (X.norm() + 1e-7)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * A @ A
@@ -58,7 +62,7 @@ class Muon(torch.optim.Optimizer):
                 g = (p.grad.add(buf, alpha=group["momentum"])
                      if group["nesterov"] else buf)
                 u = zeropower_via_newtonschulz5(g, group["ns_steps"])
-                scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
                 p.add_(u.to(p.dtype), alpha=-group["lr"] * scale)
 
 

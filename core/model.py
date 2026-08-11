@@ -123,6 +123,19 @@ class GPTConfig:
     # cheap: iterations cost ~w^2 so 4x at the waist is ~1/3 of one
     # full-width layer.
     loops: str = ""
+    # Four-stroke machine population (core/fourstroke.py, 2026-08-11):
+    # K persistent machines beside the stream; intake -> publish ->
+    # conference -> gated write-back. Block-level only for now (model
+    # assembly TBD); all knobs live here so the block survives whatever
+    # seq/d_model/K the run settles on.
+    fs_n_machines: int = 16
+    fs_d_machine: int = 256
+    fs_n_head_m: int = 4       # heads inside intake + conference attention
+    fs_mlp_mult: int = 4       # private per-machine MLP expansion
+    fs_backend: str = "attn"   # "attn" | "swa" (linear/ttt deferred)
+    fs_window: int = 512       # swa backend's band
+    fs_rope: bool = True       # rotate intake q/k (conference position-free)
+    fs_addr_mix: float = 1.0   # init of anchor-vs-state key mixing scalar
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
@@ -181,7 +194,7 @@ class GPTConfig:
             f"{self.n_layer_total()} layers")
         key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow",
                "K": "chunk", "B": "blocksum", "N": "chunkv2",
-               "T": "topkside", "R": "swaside"}
+               "T": "topkside", "R": "swaside", "M": "fourstroke"}
         return [key[c] for c in self.attn_pattern]
 
     def layer_windows(self):
@@ -189,8 +202,11 @@ class GPTConfig:
         full layers. Resolves cfg.windows; empty = uniform cfg.window."""
         attns = self.layer_attns()
         # topkside layers are full-attention layers (the branch replaces
-        # the MLP, not the window) — no window entry applies to them
-        full = [k == self.attn or k == "topkside" for k in attns]
+        # the MLP, not the window) — no window entry applies to them.
+        # fourstroke (M) layers window their INTAKE via cfg.fs_window,
+        # not the token-path window schedule.
+        full = [k == self.attn or k in ("topkside", "fourstroke")
+                for k in attns]
         if not self.windows:
             return [None if f else self.window
                     for f, k in zip(full, attns)]
@@ -422,6 +438,9 @@ def make_block(cfg, attn_key):
     if attn_key in ("topkside", "swaside"):
         from core.sidestack import TopKSideBlock
         return TopKSideBlock(cfg, attn_key=attn_key)
+    if attn_key == "fourstroke":
+        from core.fourstroke import FourStrokeBlock
+        return FourStrokeBlock(cfg)
     return BLOCKS[cfg.block](cfg, attn_key=attn_key)
 
 
@@ -431,6 +450,10 @@ class GPT(nn.Module):
         assert cfg.pos in ("learned", "rope"), cfg.pos
         self.cfg = cfg
         def build(key, w, win, lp):
+            if key == "fourstroke":
+                # M blocks thread the machine channel through forward —
+                # incompatible with hourglass slicing and weight-tied loops
+                assert w == cfg.n_embd and lp == 1, (key, w, lp)
             lcfg = (cfg if win is None or win == cfg.window
                     else replace(cfg, window=win))
             b = (make_block(lcfg, key) if w == cfg.n_embd
@@ -493,8 +516,15 @@ class GPT(nn.Module):
             pos = torch.arange(T, device=idx.device)
             x = x + self.transformer.wpe(pos)
         x = self.transformer.drop(x)
+        chan = None   # machine channel, threaded between M blocks
         for block in self.transformer.h:
-            x = block(x)
+            if hasattr(block, "strokes"):
+                if chan is None:
+                    chan = block.strokes.init_channel(
+                        B, T, device=x.device, dtype=x.dtype)
+                x, chan = block(x, chan)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         def cap(lg):
@@ -569,7 +599,8 @@ class GPT(nn.Module):
         # hourglass layers score at their own (narrower) width; windowed
         # layers at their own (per-layer, cfg.windows) window; looped
         # layers score once per iteration
-        score = sum(lp * 12 * w * (nsa_keys if k == "nsa"
+        score = sum(lp * 12 * w * (0.0 if k == "fourstroke"
+                                   else nsa_keys if k == "nsa"
                                    else T if win is None
                                    else cow_keys if k == "cow"
                                    else avg_keys(win) + chunk_keys.get(k, 0.0))
@@ -577,6 +608,12 @@ class GPT(nn.Module):
                                              self.cfg.layer_widths(),
                                              self.cfg.layer_windows(),
                                              self.cfg.layer_loops()))
+        # fourstroke (M) layers score at machine width, not token width:
+        # intake over two banded sources + the K x K conference
+        n_fs = sum(k == "fourstroke" for k in self.cfg.layer_attns())
+        if n_fs:
+            from core.fourstroke import fourstroke_score_flops
+            score += n_fs * fourstroke_score_flops(self.cfg, T)
         # uberloop: each extra iteration re-spends the layer's matmul
         # FLOPs on weight-tied params that 6*N bills only once
         score += sum(6 * (lp - 1)
@@ -620,7 +657,9 @@ class GPT(nn.Module):
         if opt == "muon":
             from core.muon import Muon, ComboOptimizer
             hidden = [p for n, p in params
-                      if p.dim() == 2 and n.startswith("transformer.h.")
+                      if n.startswith("transformer.h.")
+                      and (p.dim() == 2
+                           or getattr(p, "MUON_STACKED", False))
                       and not n.endswith(".registers")]  # embeddings-like
             hid_ids = {id(p) for p in hidden}
             rest = [p for _, p in params if id(p) not in hid_ids]

@@ -39,6 +39,10 @@ from core.model import GPT, GPTConfig, config_dict               # noqa: E402
 # seam keys (--block/--attn/--mlp).
 SCALES = {
     "124m":  dict(n_layer=12, n_head=12, n_embd=768),
+    # four-stroke MMMF run: 12 layers at d512 (capacity deliberately moved
+    # from the token stream into the machine population; K*d_machine =
+    # 2048 of structured state on a 512-wide carrier)
+    "d512":  dict(n_layer=12, n_head=8, n_embd=512),
     "small": dict(n_layer=8, n_head=8, n_embd=512),
     "smoke": dict(n_layer=4, n_head=4, n_embd=256, block_size=256),
 }
@@ -71,9 +75,10 @@ def parse_args():
     ap.add_argument("--attn-pattern", default="",
                     help="per-layer attention, one char per layer: F=full, "
                          "S=sliding window, G=admission-gated, C=COW "
-                         "archive. The 2:1 sandwich is FGGGGFFGGGGF (gated) "
-                         "/ FSSSSFFSSSSF (SWA control) / FCCCCFFCCCCF "
-                         "(COW). Empty = all layers --attn")
+                         "archive, M=four-stroke machine block. The 2:1 "
+                         "sandwich is FGGGGFFGGGGF (gated) / FSSSSFFSSSSF "
+                         "(SWA control) / FCCCCFFCCCCF (COW); the machine "
+                         "run is MMMFMMMFMMMF. Empty = all layers --attn")
     ap.add_argument("--window", type=int, default=512)
     ap.add_argument("--windows", default="",
                     help="per-layer window schedule (pyramid), comma-"
@@ -140,6 +145,26 @@ def parse_args():
                          "1,1,1,2,2,4,4,4,4,2,1,1). Empty = no looping")
     ap.add_argument("--cow-chunk", type=int, default=128,
                     help="C layers: chain-scan chunk (heads frozen within)")
+    # Four-stroke machine blocks (M layers, core/fourstroke.py)
+    ap.add_argument("--fs-n-machines", type=int, default=16,
+                    help="M layers: machines per block (K)")
+    ap.add_argument("--fs-d-machine", type=int, default=256,
+                    help="M layers: machine state width")
+    ap.add_argument("--fs-n-head-m", type=int, default=4,
+                    help="M layers: heads inside intake + conference")
+    ap.add_argument("--fs-mlp-mult", type=int, default=4,
+                    help="M layers: private per-machine MLP expansion")
+    ap.add_argument("--fs-backend", default="attn",
+                    choices=("attn", "swa"),
+                    help="M layers: state backend over stream + private "
+                         "channel (swa = banded intake, the launch config)")
+    ap.add_argument("--fs-window", type=int, default=512,
+                    help="M layers: swa backend's intake band")
+    ap.add_argument("--fs-no-rope", action="store_true",
+                    help="M layers: disable RoPE on intake q/k")
+    ap.add_argument("--fs-addr-mix", type=float, default=1.0,
+                    help="M layers: init of the anchor-vs-state key "
+                         "mixing scalar")
     # Frankenstein stack (all default off; see core/model.py)
     ap.add_argument("--norm", default="ln", choices=("ln", "rms"))
     ap.add_argument("--qk-norm", action="store_true")
@@ -308,6 +333,14 @@ def main():
                     side_topk=args.side_topk, loops=args.loops,
                     nsa_block=args.nsa_block, nsa_topk=args.nsa_topk,
                     nsa_nreg=args.nsa_nreg,
+                    fs_n_machines=args.fs_n_machines,
+                    fs_d_machine=args.fs_d_machine,
+                    fs_n_head_m=args.fs_n_head_m,
+                    fs_mlp_mult=args.fs_mlp_mult,
+                    fs_backend=args.fs_backend,
+                    fs_window=args.fs_window,
+                    fs_rope=not args.fs_no_rope,
+                    fs_addr_mix=args.fs_addr_mix,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,
