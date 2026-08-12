@@ -170,7 +170,7 @@ class SharedLinear(nn.Module):
 
 class MachineMLP(nn.Module):
     """Private per-machine MLP, relu^2, residual applied by the caller.
-    fs_mlp_depth > 1 inserts square (mult*d x mult*d) hidden layers — the
+    fs_mlp_depth > 1 inserts square (mult*d x mult*d) hidden layers â€” the
     most arithmetic-dense GEMMs in the arm, and routed, so their params
     are cheap on the FLOPs ledger at top-k."""
 
@@ -207,7 +207,7 @@ class AttnBackend(nn.Module):
         self.ln_q = make_norm(cfg, d)
         self.ln_p = make_norm(cfg, d)     # private-channel keys/values
         self.w_q = MachineLinear(K, d, d)
-        # token intake k/v: private per machine (v1), or — fs_tkv_heads>0 —
+        # token intake k/v: private per machine (v1), or â€” fs_tkv_heads>0 â€”
         # ONE shared bank of that many heads, projected once per block;
         # machine m's head h reads bank head (m*H + h) % bank_h, so
         # machines are spread across the bank and differ by their private
@@ -339,7 +339,7 @@ class MachineStrokes(nn.Module):
         self.K, self.d = K, d
         # identity: innate character + fixed address component, orthogonal
         # rows so machines start distinguishable (spec section 5). Only the
-        # FIRST machine block owns s0 — later blocks' channels come from
+        # FIRST machine block owns s0 â€” later blocks' channels come from
         # their predecessor, so their seeds would never touch the loss and
         # DDP's reducer errors on the orphaned params (8x, 2026-08-11).
         if seed:
@@ -353,7 +353,7 @@ class MachineStrokes(nn.Module):
         self.addr_mix = nn.Parameter(torch.full((K,), cfg.fs_addr_mix))
         self.backend = make_backend(cfg)
         self.ln_iface = make_norm(cfg, d)     # RMSNorm-on-s (spec section 5)
-        # publish: private per machine (v1) or — fs_share_pub — one shared
+        # publish: private per machine (v1) or â€” fs_share_pub â€” one shared
         # interface projection; machine identity survives via the anchor
         # keys and the private state content
         share = getattr(cfg, "fs_share_pub", False)
@@ -370,7 +370,7 @@ class MachineStrokes(nn.Module):
         # --- v2 features, all inert at their config defaults ---
         # top-k activation (fs_topk > 0): per (token, machine) router from
         # (x, c_prev); unrouted pairs SKIP the state refresh (intake+MLP)
-        # and pass c_prev through — still published/readable in conference
+        # and pass c_prev through â€” still published/readable in conference
         # (interp 2026-08-12: services are read without writing). The same
         # k also caps the write-back gates. Routed pairs' refresh is scaled
         # by the router sigmoid (its gradient path).
@@ -381,7 +381,7 @@ class MachineStrokes(nn.Module):
             self.route_b = nn.Parameter(torch.zeros(K))
         self.lb_loss = None
         # conference sink (fs_conf_sink): ONE learned logit per head
-        # appended to the conference softmax with a zero value — reading
+        # appended to the conference softmax with a zero value â€” reading
         # "nothing" is legal (NSA register mech-interp recommendation).
         self.conf_sink = (nn.Parameter(torch.zeros(cfg.fs_n_head_m))
                           if cfg.fs_conf_sink else None)
@@ -392,7 +392,7 @@ class MachineStrokes(nn.Module):
         # top-fs_loop_topk machines per token per round.
         self.rounds = cfg.fs_loop_rounds
         self.loop_topk = cfg.fs_loop_topk
-        # fs_sparse_state: conference reads are transient � only ROUTED
+        # fs_sparse_state: conference reads are transient — only ROUTED
         # pairs absorb the round into persistent state; sleepers stay
         # bit-frozen (readable, never drifting)
         self.sparse_state = getattr(cfg, "fs_sparse_state", False)
@@ -507,7 +507,7 @@ def fourstroke_score_flops(cfg, T):
 
       + intake scores (12*d*keys convention, two key sources), spent only
         by the routed fraction frac = topk/K (top-k skips the refresh)
-      + conference scores K x K at d_machine (dense — every machine stays
+      + conference scores K x K at d_machine (dense â€” every machine stays
         readable; sink column is one extra key, ignored as ~1/K)
       - unrouted pairs skip intake private params (w_q, w_pkv, w_out, MLP)
         and the write-back w_o that 6*N already billed
@@ -536,12 +536,12 @@ def fourstroke_score_flops(cfg, T):
     # publish/conference param spend per round: private stacks are billed
     # once by 6*N (numel = K * 4d^2); a SHARED interface is billed once by
     # 6*N but applied K times per token, so the extra (K-1) applications
-    # are a surcharge here — and every loop round re-spends the full K.
+    # are a surcharge here â€” and every loop round re-spends the full K.
     p_pub_apply = K * (3 * d * d + d * d)              # round-1 spend
     if cfg.fs_share_pub:
         score += 6 * (K - 1) * (3 * d * d + d * d)     # round 1 surcharge
     # rounds >= 2: a machine re-publishes only if its state moved, and
-    # fs_loop_topk caps movers per token — unchanged machines' published
+    # fs_loop_topk caps movers per token â€” unchanged machines' published
     # k/v are bit-identical to last round's (cacheable), so re-publish is
     # charged at the loop fraction; conference scores stay dense (all K
     # remain readable every round).
