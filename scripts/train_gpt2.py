@@ -440,6 +440,7 @@ def main():
                         and torch.cuda.is_available()
                         and _gsw._resolve_flash() is not None)
         if ddp and (args.arch == "hier" or args.attn == "nsa"
+                    or "M" in args.attn_pattern
                     or (not flash_covers
                         and (args.diff_attn
                              or any(c in args.attn_pattern
@@ -455,6 +456,9 @@ def main():
             # compiled trains clean 10.8->0.46 in 30 steps, 8x DDP loss
             # is nan by step 10) — silent-corruption cousin of the same
             # splitter, so whole-graph compile for nsa too.
+            # Four-stroke (M) threads the machine channel BETWEEN blocks
+            # — exactly the cross-bucket dependency the splitter mangles;
+            # whole-graph preemptively (nsa's NaN was silent).
             # Compile the whole graph instead; costs the
             # backward/allreduce overlap (~few % at 124M).
             torch._dynamo.config.optimize_ddp = False
