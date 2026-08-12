@@ -178,6 +178,8 @@ def parse_args():
                     help="four-stroke: share publish/conference projections")
     ap.add_argument("--fs-mlp-depth", type=int, default=1,
                     help="four-stroke: hidden layers in the private MLP")
+    ap.add_argument("--fs-sparse-state", action="store_true",
+                    help="four-stroke: only routed pairs absorb the round")
     ap.add_argument("--fs-addr-mix", type=float, default=1.0,
                     help="M layers: init of the anchor-vs-state key "
                          "mixing scalar")
@@ -364,6 +366,7 @@ def main():
                     fs_tkv_heads=args.fs_tkv_heads,
                     fs_share_pub=args.fs_share_pub,
                     fs_mlp_depth=args.fs_mlp_depth,
+                    fs_sparse_state=args.fs_sparse_state,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

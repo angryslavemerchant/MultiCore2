@@ -36,8 +36,11 @@ def mimo_cfg():
 def fourstroke_cfg():
     return GPTConfig(n_layer=12, n_head=8, n_embd=512,
                      attn_pattern="MMMFMMMFMMMF",
-                     fs_n_machines=16, fs_d_machine=128, fs_n_head_m=2,
-                     fs_backend="swa", fs_window=128, **SPEEDRUN)
+                     fs_n_machines=16, fs_d_machine=256, fs_n_head_m=4,
+                     fs_backend="swa", fs_window=128,
+                     fs_topk=4, fs_loop_rounds=2, fs_loop_topk=4,
+                     fs_conf_sink=True, fs_tkv_heads=16, fs_mlp_depth=2,
+                     fs_sparse_state=True, **SPEEDRUN)
 
 
 def bench(name, cfg, batch, steps, compile_model=True):

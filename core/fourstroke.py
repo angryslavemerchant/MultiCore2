@@ -392,6 +392,10 @@ class MachineStrokes(nn.Module):
         # top-fs_loop_topk machines per token per round.
         self.rounds = cfg.fs_loop_rounds
         self.loop_topk = cfg.fs_loop_topk
+        # fs_sparse_state: conference reads are transient — only ROUTED
+        # pairs absorb the round into persistent state; sleepers stay
+        # bit-frozen (readable, never drifting)
+        self.sparse_state = getattr(cfg, "fs_sparse_state", False)
         if self.rounds > 1:
             self.loop_w = nn.Parameter(torch.zeros(K, d))
             self.loop_b = nn.Parameter(torch.full((K,), 2.0))
@@ -452,6 +456,8 @@ class MachineStrokes(nn.Module):
             if route is not None:
                 s = c + route * (s - c)     # unrouted: state passes through
             cand = self._confer(s)
+            if self.sparse_state and route is not None:
+                cand = c + route * (cand - c)
             if r == 0:
                 c = cand
             else:

@@ -482,3 +482,20 @@ def test_v2_shared_flop_accounting():
     assert (fourstroke_score_flops(deep, T)
             < fourstroke_score_flops(shallow, T) + 6 * 3 * (
                 shallow.fs_mlp_mult * shallow.fs_d_machine) ** 2)
+
+
+def test_v2_sparse_state_freezes_sleepers():
+    """With fs_sparse_state, an unrouted machine's state is bit-frozen
+    even though the conference output is nonzero."""
+    blk = make_block(29, fs_topk=1, fs_sparse_state=True,
+                     fs_loop_rounds=2, fs_loop_topk=1)
+    with torch.no_grad():
+        blk.strokes.route_x.zero_()
+        blk.strokes.route_c.zero_()
+        blk.strokes.route_b.copy_(torch.tensor([10.0, -10.0, -10.0]))
+    torch.manual_seed(30)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    c0 = blk.strokes.init_channel(B, T, dtype=torch.float64)
+    _, c = blk(x, c0)
+    assert torch.equal(c[:, 1:], c0[:, 1:])       # sleepers frozen
+    assert not torch.equal(c[:, :1], c0[:, :1])   # routed machine moved
