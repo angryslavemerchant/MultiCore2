@@ -93,6 +93,35 @@ def _band_mask(nq, nk, off, window, device):
     return hit
 
 
+def _band_mask_all(nc, Q, w, device):
+    """(nc, Q, 2*(Q+w-1)) bool for the single-kernel path: chunk c's
+    query i sits at absolute t = c*Q + i; per-source key slot j' holds
+    absolute position c*Q + j' - (w-1) (front-padded), valid iff that
+    position is in (t-w, t] and >= 0 (chunk 0's pad slots are ghosts)."""
+    key = ("all", nc, Q, w, str(device))
+    hit = _MASK_CACHE.get(key)
+    if hit is None:
+        n = Q + w - 1
+        c = torch.arange(nc, device=device)[:, None, None]
+        i = torch.arange(Q, device=device)[None, :, None]
+        j = torch.arange(n, device=device)[None, None, :]
+        pos = c * Q + j - (w - 1)
+        t = c * Q + i
+        vis = (pos <= t) & (pos > t - w) & (pos >= 0)
+        hit = torch.cat((vis, vis), dim=-1)
+        _MASK_CACHE[key] = hit
+    return hit
+
+
+def _unfold_keys(x, Q, w):
+    """(B_, H, T, hd) -> (B_, nc, H, Q+w-1, hd): front-pad w-1 ghost
+    positions, then window per query chunk (dup factor ~(Q+w)/Q)."""
+    B_, H, T, hd = x.shape
+    xp = F.pad(x, (0, 0, w - 1, 0))
+    u = xp.unfold(2, Q + w - 1, Q)            # (B_, H, nc, hd, n)
+    return u.permute(0, 2, 1, 4, 3)
+
+
 class MachineLinear(nn.Module):
     """Per-machine linear, weights stacked (K, d_in, d_out).
     Input (B, K, T, d_in) -> (B, K, T, d_out). No bias (machine identity
@@ -118,7 +147,11 @@ class TokenLinear(nn.Module):
         self.weight.MUON_STACKED = True
 
     def forward(self, x):
-        return torch.einsum("btc,kcd->bktd", x, self.weight)
+        # one (B*T, C) @ (C, K*d) GEMM instead of a K-way bmm
+        B, T, C = x.shape
+        K, _, d = self.weight.shape
+        w = self.weight.permute(1, 0, 2).reshape(C, K * d)
+        return (x.reshape(B * T, C) @ w).view(B, T, K, d).transpose(1, 2)
 
 
 class MachineMLP(nn.Module):
@@ -187,9 +220,31 @@ class AttnBackend(nn.Module):
 
     def _banded(self, q, k_tok, v_tok, k_prv, v_prv):
         """Streamed swa intake: query chunks against their own band of
-        [token, private] keys. One softmax over both sources per query
-        (concat within the chunk), never anything (T, 2T)-shaped."""
-        T, w = q.shape[2], self.window
+        [token, private] keys. One softmax over both sources per query,
+        never anything (T, 2T)-shaped. When T divides into CHUNK_Q the
+        chunks are batched into ONE SDPA call (chunk dim folded into
+        batch, keys unfolded with front padding) -- 16 small masked
+        kernels per block collapse into one saturating one."""
+        B_, H, T, hd = q.shape
+        w = self.window
+        if T % CHUNK_Q == 0 and T > CHUNK_Q:
+            Q = CHUNK_Q
+            nc, n = T // Q, Q + w - 1
+            qq = (q.view(B_, H, nc, Q, hd).permute(0, 2, 1, 3, 4)
+                  .reshape(B_ * nc, H, Q, hd))
+            k = torch.cat((_unfold_keys(k_tok, Q, w),
+                           _unfold_keys(k_prv, Q, w)),
+                          dim=3).reshape(B_ * nc, H, 2 * n, hd)
+            v = torch.cat((_unfold_keys(v_tok, Q, w),
+                           _unfold_keys(v_prv, Q, w)),
+                          dim=3).reshape(B_ * nc, H, 2 * n, hd)
+            mask = (_band_mask_all(nc, Q, w, q.device)
+                    .view(1, nc, 1, Q, 2 * n)
+                    .expand(B_, nc, 1, Q, 2 * n)
+                    .reshape(B_ * nc, 1, Q, 2 * n))
+            y = F.scaled_dot_product_attention(qq, k, v, attn_mask=mask)
+            return (y.view(B_, nc, H, Q, hd).permute(0, 2, 1, 3, 4)
+                    .reshape(B_, H, T, hd))
         outs = []
         for s in range(0, T, CHUNK_Q):
             e = min(s + CHUNK_Q, T)

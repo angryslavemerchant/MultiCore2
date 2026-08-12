@@ -168,17 +168,19 @@ def test_flop_counter():
         fourstroke_score_flops(cfg_s, big_t) > 0
 
 
-def test_banded_matches_dense_mask(monkeypatch):
-    """The streamed swa intake (query chunks, per-chunk masks) must equal
-    the dense (T, 2T)-mask reference exactly. CHUNK_Q forced tiny so the
-    chunk loop, edge chunks, and the shared-mask cache all execute."""
+@pytest.mark.parametrize("chunk_q", [4, 3])
+def test_banded_matches_dense_mask(monkeypatch, chunk_q):
+    """The streamed swa intake must equal the dense (T, 2T)-mask
+    reference exactly. chunk_q=4 divides T=8 -> the batched single-SDPA
+    path (unfolded keys, chunk-0 ghost masking); chunk_q=3 does not ->
+    the per-chunk loop fallback."""
     w = 3
     blk = make_block(fs_backend="swa", fs_window=w)
     be = blk.strokes.backend
     torch.manual_seed(11)
     x = torch.randn(B, T, C, dtype=torch.float64)
     c0 = blk.strokes.init_channel(B, T, dtype=torch.float64)
-    monkeypatch.setattr(fs, "CHUNK_Q", 4)
+    monkeypatch.setattr(fs, "CHUNK_Q", chunk_q)
     s_stream = be(blk.ln_1(x), c0)
 
     # dense reference: same projections, full concat + (T, 2T) mask
