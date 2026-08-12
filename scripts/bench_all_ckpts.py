@@ -65,7 +65,13 @@ def main():
             print(f"[bench_all] {name}: no best.pt, skipping", flush=True)
             skipped.append(name)
             continue
-        todo = [a for a in jobs if a not in files or args.force]
+        run_jobs = dict(jobs)
+        if "4stroke" in name:
+            # gate/conference autopsy only applies to machine-population
+            # arms; keying on the name keeps old runs' todo lists empty
+            run_jobs["fourstroke_gates.json"] = [
+                sys.executable, "scripts/diag_fourstroke_gates.py"]
+        todo = [a for a in run_jobs if a not in files or args.force]
         if not todo:
             print(f"[bench_all] {name}: already benchmarked, skipping",
                   flush=True)
@@ -82,7 +88,7 @@ def main():
                 continue
         ok = True
         for artifact in todo:
-            proc = subprocess.run(jobs[artifact] + ["--run-name", name],
+            proc = subprocess.run(run_jobs[artifact] + ["--run-name", name],
                                   timeout=7200)
             if proc.returncode != 0:
                 print(f"[bench_all] {name}: {artifact} FAILED "
