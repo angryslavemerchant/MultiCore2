@@ -184,10 +184,8 @@ class AttnBackend(nn.Module):
         self.ln_q = make_norm(cfg, d)
         self.ln_p = make_norm(cfg, d)     # private-channel keys/values
         self.w_q = MachineLinear(K, d, d)
-        self.w_tk = TokenLinear(K, C, d)  # token intake (x is ln'd by block)
-        self.w_tv = TokenLinear(K, C, d)
-        self.w_pk = MachineLinear(K, d, d)
-        self.w_pv = MachineLinear(K, d, d)
+        self.w_tkv = TokenLinear(K, C, 2 * d)  # token intake k,v fused
+        self.w_pkv = MachineLinear(K, d, 2 * d)  # private-channel k,v fused
         self.w_out = MachineLinear(K, d, d)
         self.mlp = MachineMLP(cfg)
         self.ln_mlp = make_norm(cfg, d)
@@ -199,11 +197,10 @@ class AttnBackend(nn.Module):
     def forward(self, x_tok, c_prev):
         B, K, T, d = c_prev.shape
         q = self._heads(self.w_q(self.ln_q(c_prev)))
-        pn = self.ln_p(c_prev)
-        k_tok = self._heads(self.w_tk(x_tok))
-        v_tok = self._heads(self.w_tv(x_tok))
-        k_prv = self._heads(self.w_pk(pn))
-        v_prv = self._heads(self.w_pv(pn))
+        k_tok, v_tok = self.w_tkv(x_tok).chunk(2, dim=-1)
+        k_prv, v_prv = self.w_pkv(self.ln_p(c_prev)).chunk(2, dim=-1)
+        k_tok, v_tok = self._heads(k_tok), self._heads(v_tok)
+        k_prv, v_prv = self._heads(k_prv), self._heads(v_prv)
         if self.use_rope:
             q, k_tok = apply_rope(q, k_tok)
             k_prv = apply_rope(k_prv, k_prv)[0]
@@ -285,9 +282,7 @@ class MachineStrokes(nn.Module):
         self.addr_mix = nn.Parameter(torch.full((K,), cfg.fs_addr_mix))
         self.backend = make_backend(cfg)
         self.ln_iface = make_norm(cfg, d)     # RMSNorm-on-s (spec section 5)
-        self.w_q = MachineLinear(K, d, d)
-        self.w_k = MachineLinear(K, d, d)
-        self.w_v = MachineLinear(K, d, d)
+        self.w_qkv = MachineLinear(K, d, 3 * d)  # interface q,k,v fused
         self.conf_out = MachineLinear(K, d, d)
         # write-back: per-machine gate on [x_t ; c_k], zero-init W_O so the
         # token residual is untouched at init
@@ -306,10 +301,9 @@ class MachineStrokes(nn.Module):
         K, d = self.s0.shape
         s = self.backend(x, c_prev)                       # stroke 1
         sn = self.ln_iface(s)
-        q = self.w_q(sn)                                  # stroke 2
+        q, ks, v = self.w_qkv(sn).chunk(3, dim=-1)        # stroke 2
         k = (self.anchor[None, :, None, :]
-             + self.addr_mix[None, :, None, None] * self.w_k(sn))
-        v = self.w_v(sn)
+             + self.addr_mix[None, :, None, None] * ks)
 
         def heads(t):     # (B,K,T,d) -> (B*T, H, K, hd): attention over K
             return (t.permute(0, 2, 1, 3)

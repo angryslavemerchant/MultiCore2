@@ -139,10 +139,10 @@ def test_gradients_reach_everything():
         opt.step()
     s = blk.strokes
     for name, p in [("anchor", s.anchor), ("s0", s.s0),
-                    ("addr_mix", s.addr_mix), ("w_q", s.w_q.weight),
+                    ("addr_mix", s.addr_mix), ("w_qkv", s.w_qkv.weight),
                     ("gate_x", s.gate_x),
                     ("backend.w_q", s.backend.w_q.weight),
-                    ("backend.w_tk", s.backend.w_tk.weight)]:
+                    ("backend.w_tkv", s.backend.w_tkv.weight)]:
         assert p.grad is not None and p.grad.abs().max() > 0, name
     assert losses[-1] < losses[0]
 
@@ -187,11 +187,10 @@ def test_banded_matches_dense_mask(monkeypatch, chunk_q):
     def dense(x_tok, c_prev):
         Bx, K, Tx, d = c_prev.shape
         q = be._heads(be.w_q(be.ln_q(c_prev)))
-        pn = be.ln_p(c_prev)
-        k_tok = be._heads(be.w_tk(x_tok))
-        v_tok = be._heads(be.w_tv(x_tok))
-        k_prv = be._heads(be.w_pk(pn))
-        v_prv = be._heads(be.w_pv(pn))
+        k_tok, v_tok = be.w_tkv(x_tok).chunk(2, dim=-1)
+        k_prv, v_prv = be.w_pkv(be.ln_p(c_prev)).chunk(2, dim=-1)
+        k_tok, v_tok = be._heads(k_tok), be._heads(v_tok)
+        k_prv, v_prv = be._heads(k_prv), be._heads(v_prv)
         from core.rope import apply_rope
         q, k_tok = apply_rope(q, k_tok)
         k_prv = apply_rope(k_prv, k_prv)[0]
@@ -250,14 +249,14 @@ def test_muon_routes_stacked_params():
     s = model.transformer.h[0].strokes
     idx = torch.randint(0, 128, (1, T))
     wo_before = s.w_o.weight.clone()
-    wq_before = s.w_q.weight.clone()
+    wq_before = s.w_qkv.weight.clone()
     for _ in range(2):
         combo.zero_grad()
         _, loss = model(idx, idx)
         loss.backward()
         combo.step()
     assert not torch.equal(wo_before, s.w_o.weight)
-    assert not torch.equal(wq_before, s.w_q.weight)
+    assert not torch.equal(wq_before, s.w_qkv.weight)
 
 
 def test_batched_newtonschulz_matches_per_slice():
