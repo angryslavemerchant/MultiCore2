@@ -162,6 +162,22 @@ def parse_args():
                     help="M layers: swa backend's intake band")
     ap.add_argument("--fs-no-rope", action="store_true",
                     help="M layers: disable RoPE on intake q/k")
+    ap.add_argument("--fs-topk", type=int, default=0,
+                    help="four-stroke: machines refreshed/writing per token "
+                         "(0 = dense population)")
+    ap.add_argument("--fs-loop-rounds", type=int, default=1,
+                    help="four-stroke: strokes 1-4 rounds per block (tied)")
+    ap.add_argument("--fs-loop-topk", type=int, default=0,
+                    help="four-stroke: machines updating per loop round")
+    ap.add_argument("--fs-conf-sink", action="store_true",
+                    help="four-stroke: learned null logit in conference")
+    ap.add_argument("--fs-tkv-heads", type=int, default=0,
+                    help="four-stroke: shared token-KV bank heads "
+                         "(0 = private per machine)")
+    ap.add_argument("--fs-share-pub", action="store_true",
+                    help="four-stroke: share publish/conference projections")
+    ap.add_argument("--fs-mlp-depth", type=int, default=1,
+                    help="four-stroke: hidden layers in the private MLP")
     ap.add_argument("--fs-addr-mix", type=float, default=1.0,
                     help="M layers: init of the anchor-vs-state key "
                          "mixing scalar")
@@ -341,6 +357,13 @@ def main():
                     fs_window=args.fs_window,
                     fs_rope=not args.fs_no_rope,
                     fs_addr_mix=args.fs_addr_mix,
+                    fs_topk=args.fs_topk,
+                    fs_loop_rounds=args.fs_loop_rounds,
+                    fs_loop_topk=args.fs_loop_topk,
+                    fs_conf_sink=args.fs_conf_sink,
+                    fs_tkv_heads=args.fs_tkv_heads,
+                    fs_share_pub=args.fs_share_pub,
+                    fs_mlp_depth=args.fs_mlp_depth,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

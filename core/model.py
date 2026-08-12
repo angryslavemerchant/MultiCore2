@@ -136,6 +136,15 @@ class GPTConfig:
     fs_window: int = 512       # swa backend's band
     fs_rope: bool = True       # rotate intake q/k (conference position-free)
     fs_addr_mix: float = 1.0   # init of anchor-vs-state key mixing scalar
+    fs_topk: int = 0           # 0 = dense; else machines refreshed/writing
+                               # per token (router; conference stays dense)
+    fs_loop_rounds: int = 1    # strokes 1-4 iterations per block (tied)
+    fs_loop_topk: int = 0      # 0 = all; else machines updating per round
+    fs_conf_sink: bool = False  # learned per-head null logit in conference
+    fs_tkv_heads: int = 0      # 0 = private token k/v per machine; else ONE
+                               # shared bank with this many heads (MQA-ish)
+    fs_share_pub: bool = False  # share publish/conference projections
+    fs_mlp_depth: int = 1      # hidden layers in the private MLP
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)

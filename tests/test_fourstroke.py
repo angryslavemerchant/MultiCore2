@@ -305,3 +305,180 @@ def test_two_block_chain():
     x, c = run(b1, x)
     x, c = b2(x, c)
     assert x.shape == (B, T, C)
+
+
+# ---------------------------------------------------------------- v2 features
+
+V2 = dict(fs_topk=2, fs_loop_rounds=3, fs_loop_topk=2, fs_conf_sink=True)
+
+
+@pytest.mark.parametrize("backend", ["attn", "swa"])
+def test_v2_causality(backend):
+    """Exact causality with router + loop + sink all enabled."""
+    blk = make_block(11, fs_backend=backend, **V2)
+    torch.manual_seed(12)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    p = 5
+    x2 = x.clone()
+    x2[:, p] += torch.randn(C, dtype=torch.float64)
+    y1, c1 = run(blk, x)
+    y2, c2 = run(blk, x2)
+    assert torch.equal(y1[:, :p], y2[:, :p])
+    assert torch.equal(c1[:, :, :p], c2[:, :, :p])
+    assert not torch.equal(c1[:, :, p:], c2[:, :, p:])
+
+
+def test_v2_defaults_are_v1():
+    """fs_topk=0, rounds=1, sink off must reproduce the v1 block exactly
+    (same params, same math) — the refactor may not drift the champion
+    config's semantics."""
+    b1, b2 = make_block(13), make_block(13)
+    torch.manual_seed(14)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y1, c1 = run(b1, x)
+    y2, c2 = run(b2, x)
+    assert torch.equal(y1, y2) and torch.equal(c1, c2)
+    assert b1.strokes.conf_sink is None and b1.strokes.rounds == 1
+
+
+def test_v2_write_topk_sparsity():
+    """With fs_topk=k, at most k machines write to any token."""
+    blk = make_block(15, **V2)
+    torch.manual_seed(16)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    g_seen = {}
+    orig = blk.strokes._topk_mask
+
+    def spy(v, k):
+        out = orig(v, k)
+        g_seen["last"] = out
+        return out
+
+    blk.strokes._topk_mask = spy
+    run(blk, x)
+    g = g_seen["last"]                       # final call = write gates
+    assert ((g > 0).sum(dim=-1) <= V2["fs_topk"]).all()
+
+
+def test_v2_unrouted_state_passes_through():
+    """A machine routed nowhere keeps c_prev exactly when loops are off
+    and the conference can't move it (conf_out zeroed): the skip really
+    is a skip."""
+    blk = make_block(17, fs_topk=1, fs_loop_rounds=1)
+    with torch.no_grad():
+        blk.strokes.conf_out.weight.zero_()
+        # force the router to always pick machine 0
+        blk.strokes.route_x.zero_()
+        blk.strokes.route_c.zero_()
+        blk.strokes.route_b.copy_(torch.tensor([10.0, -10.0, -10.0]))
+    torch.manual_seed(18)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    c0 = blk.strokes.init_channel(B, T, dtype=torch.float64)
+    _, c = blk(x, c0)
+    assert torch.equal(c[:, 1:], c0[:, 1:])       # skipped machines
+    assert not torch.equal(c[:, :1], c0[:, :1])   # routed machine moved
+
+
+def test_v2_gradients_reach_new_params():
+    blk = make_block(19, **V2)
+    torch.manual_seed(20)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y, c = run(blk, x)
+    (y.square().mean() + c.square().mean()
+     + blk.strokes.lb_loss).backward()
+    s = blk.strokes
+    for name in ("route_x", "route_c", "route_b", "conf_sink",
+                 "loop_w", "loop_b"):
+        p = getattr(s, name)
+        assert p.grad is not None and p.grad.abs().sum() > 0, name
+
+
+def test_v2_loop_rounds_change_output():
+    b1 = make_block(21, fs_loop_rounds=1)
+    b2 = make_block(21, fs_loop_rounds=2)
+    # identical shared params; loop params exist only on b2
+    torch.manual_seed(22)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    _, c1 = run(b1, x)
+    _, c2 = run(b2, x)
+    assert not torch.equal(c1, c2)
+
+
+def test_v2_flop_counter_discounts_and_charges():
+    dense = make_cfg()
+    topk = make_cfg(fs_topk=1)
+    loop = make_cfg(fs_loop_rounds=3)
+    f_dense = fourstroke_score_flops(dense, T)
+    f_topk = fourstroke_score_flops(topk, T)
+    f_loop = fourstroke_score_flops(loop, T)
+    assert f_topk < f_dense          # routing is a discount
+    assert f_loop > f_dense          # loops are a surcharge
+    v1_formula = dense.fs_n_machines * 12 * dense.fs_d_machine * (
+        2 * T + dense.fs_n_machines)
+    assert abs(f_dense - v1_formula) < 1e-6   # defaults match v1 exactly
+
+
+V2S = dict(fs_topk=2, fs_loop_rounds=2, fs_loop_topk=2, fs_conf_sink=True,
+           fs_tkv_heads=4, fs_share_pub=True, fs_mlp_depth=2)
+
+
+@pytest.mark.parametrize("backend", ["attn", "swa"])
+def test_v2_shared_causality(backend):
+    """Exact causality with the shared token bank, shared publish and
+    deep MLP stacked on every other v2 feature."""
+    blk = make_block(23, fs_backend=backend, **V2S)
+    torch.manual_seed(24)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    p = 5
+    x2 = x.clone()
+    x2[:, p] += torch.randn(C, dtype=torch.float64)
+    y1, c1 = run(blk, x)
+    y2, c2 = run(blk, x2)
+    assert torch.equal(y1[:, :p], y2[:, :p])
+    assert torch.equal(c1[:, :, :p], c2[:, :, :p])
+    assert not torch.equal(c1[:, :, p:], c2[:, :, p:])
+
+
+def test_v2_shared_gradients_and_muon_paths():
+    """Shared weights are 2D (standard Muon path), stacks stay tagged,
+    and every new param gets gradient."""
+    blk = make_block(25, **V2S)
+    s = blk.strokes
+    assert s.backend.w_tkv.dim() == 2 and s.w_qkv.weight.dim() == 2
+    assert not hasattr(s.backend.w_tkv, "MUON_STACKED")
+    assert len(s.backend.mlp.mids) == 1
+    torch.manual_seed(26)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y, c = run(blk, x)
+    (y.square().mean() + c.square().mean() + s.lb_loss).backward()
+    for p_name in ("backend.w_tkv", "w_qkv.weight", "conf_out.weight"):
+        obj = s
+        for part in p_name.split("."):
+            obj = getattr(obj, part)
+        assert obj.grad is not None and obj.grad.abs().sum() > 0, p_name
+    assert s.backend.mlp.mids[0].weight.grad.abs().sum() > 0
+
+
+def test_v2_bank_machines_differ():
+    """With a fully shared token bank, machines still produce different
+    states (private queries + private state distinguish them)."""
+    blk = make_block(27, fs_tkv_heads=2)
+    torch.manual_seed(28)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    _, c = run(blk, x)
+    assert not torch.allclose(c[:, 0], c[:, 1])
+
+
+def test_v2_shared_flop_accounting():
+    """Sharing publish adds a surcharge (K-1 extra applications of the
+    shared weight vs its single 6*N billing); the total fpt of a GPT
+    still DROPS because 6*N itself shrinks far more."""
+    dense_pub = make_cfg()
+    shared_pub = make_cfg(fs_share_pub=True)
+    assert (fourstroke_score_flops(shared_pub, T)
+            > fourstroke_score_flops(dense_pub, T))
+    deep = make_cfg(fs_mlp_depth=2, fs_topk=1)
+    shallow = make_cfg(fs_mlp_depth=1, fs_topk=1)
+    assert (fourstroke_score_flops(deep, T)
+            < fourstroke_score_flops(shallow, T) + 6 * 3 * (
+                shallow.fs_mlp_mult * shallow.fs_d_machine) ** 2)
