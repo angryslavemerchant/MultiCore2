@@ -269,6 +269,23 @@ def test_batched_newtonschulz_matches_per_slice():
         assert torch.allclose(batched[k], ns(G[k]), atol=1e-2), k
 
 
+def test_no_orphan_params_mmmf():
+    """Only the first M block owns s0, and every parameter in an MMMF
+    stack participates in the loss graph — the condition DDP's reducer
+    enforces (8 orphaned seeds crashed the 8x run, 2026-08-11)."""
+    torch.manual_seed(15)
+    cfg = make_cfg(vocab_size=128, n_layer=8, attn_pattern="MMMFMMMF",
+                   fs_backend="swa", fs_window=4)
+    model = GPT(cfg)
+    seeds = [n for n, _ in model.named_parameters() if n.endswith(".s0")]
+    assert len(seeds) == 1, seeds
+    idx = torch.randint(0, 128, (1, T))
+    _, loss = model(idx, idx)
+    loss.backward()
+    missing = [n for n, p in model.named_parameters() if p.grad is None]
+    assert not missing, missing
+
+
 def test_flops_per_token_charges_machines():
     """M layers must cost more than S layers at token width but be
     charged at machine width, not as full attention."""

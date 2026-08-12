@@ -267,16 +267,23 @@ class MachineStrokes(nn.Module):
     """The four strokes; drops into a block's attention slot.
     forward(x, c_prev) -> (residual delta (B,T,C), conclusions (B,K,T,d))."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, seed=True):
         super().__init__()
         K, C, d = cfg.fs_n_machines, cfg.n_embd, cfg.fs_d_machine
         H = cfg.fs_n_head_m
         self.H, self.hd = H, d // H
+        self.K, self.d = K, d
         # identity: innate character + fixed address component, orthogonal
-        # rows so machines start distinguishable (spec section 5)
-        self.s0 = nn.Parameter(torch.empty(K, d))
+        # rows so machines start distinguishable (spec section 5). Only the
+        # FIRST machine block owns s0 — later blocks' channels come from
+        # their predecessor, so their seeds would never touch the loss and
+        # DDP's reducer errors on the orphaned params (8x, 2026-08-11).
+        if seed:
+            self.s0 = nn.Parameter(torch.empty(K, d))
+            nn.init.orthogonal_(self.s0)
+        else:
+            self.s0 = None
         self.anchor = nn.Parameter(torch.empty(K, d))
-        nn.init.orthogonal_(self.s0)
         nn.init.orthogonal_(self.anchor)
         # anchor-vs-state mixing scalar on the published key, per machine
         self.addr_mix = nn.Parameter(torch.full((K,), cfg.fs_addr_mix))
@@ -293,12 +300,13 @@ class MachineStrokes(nn.Module):
 
     def init_channel(self, B, T, device=None, dtype=None):
         """Seed conclusions for the first machine block: s0 at every t."""
+        assert self.s0 is not None, "only the seed block can init the channel"
         s0 = self.s0.to(device=device, dtype=dtype)
         return s0[None, :, None, :].expand(B, -1, T, -1).contiguous()
 
     def forward(self, x, c_prev):
         B, T, C = x.shape
-        K, d = self.s0.shape
+        K, d = self.K, self.d
         s = self.backend(x, c_prev)                       # stroke 1
         sn = self.ln_iface(s)
         q, ks, v = self.w_qkv(sn).chunk(3, dim=-1)        # stroke 2
@@ -325,10 +333,10 @@ class FourStrokeBlock(nn.Module):
     FFN on the token path (spec section 4). forward threads the machine
     channel: (x, c_prev) -> (x, c)."""
 
-    def __init__(self, cfg, attn_key=None):
+    def __init__(self, cfg, attn_key=None, seed=True):
         super().__init__()
         self.ln_1 = make_norm(cfg, cfg.n_embd)
-        self.strokes = MachineStrokes(cfg)
+        self.strokes = MachineStrokes(cfg, seed=seed)
         self.ln_2 = make_norm(cfg, cfg.n_embd)
         self.mlp = MLPS[cfg.mlp](cfg)
 

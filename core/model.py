@@ -430,17 +430,19 @@ MLPS = {"gelu": GeluMLP, "relu2": Relu2MLP}
 BLOCKS = {"gpt2": Block}
 
 
-def make_block(cfg, attn_key):
+def make_block(cfg, attn_key, fs_seed=True):
     """Block construction seam: topkside (T, full) and swaside (R,
     windowed) layers need a block whose MLP slot holds the side branch
     (it consumes the attention's internals, so attention and branch
-    can't be independent registry entries)."""
+    can't be independent registry entries). fs_seed: only the FIRST
+    fourstroke block owns the channel-seed s0 (later blocks' seeds
+    would be DDP-orphaned params)."""
     if attn_key in ("topkside", "swaside"):
         from core.sidestack import TopKSideBlock
         return TopKSideBlock(cfg, attn_key=attn_key)
     if attn_key == "fourstroke":
         from core.fourstroke import FourStrokeBlock
-        return FourStrokeBlock(cfg)
+        return FourStrokeBlock(cfg, seed=fs_seed)
     return BLOCKS[cfg.block](cfg, attn_key=attn_key)
 
 
@@ -449,14 +451,19 @@ class GPT(nn.Module):
         super().__init__()
         assert cfg.pos in ("learned", "rope"), cfg.pos
         self.cfg = cfg
+        fs_seen = [False]
+
         def build(key, w, win, lp):
+            fs_seed = False
             if key == "fourstroke":
                 # M blocks thread the machine channel through forward —
                 # incompatible with hourglass slicing and weight-tied loops
                 assert w == cfg.n_embd and lp == 1, (key, w, lp)
+                fs_seed = not fs_seen[0]    # only the first M block seeds
+                fs_seen[0] = True
             lcfg = (cfg if win is None or win == cfg.window
                     else replace(cfg, window=win))
-            b = (make_block(lcfg, key) if w == cfg.n_embd
+            b = (make_block(lcfg, key, fs_seed=fs_seed) if w == cfg.n_embd
                  else SliceBlock(lcfg, key, w))
             return LoopedBlock(b, lp, cfg.n_embd) if lp > 1 else b
 
