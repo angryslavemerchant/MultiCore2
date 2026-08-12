@@ -37,6 +37,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--only", type=str, default=None,
+                    help="substring filter: bench only run names containing "
+                         "this (e.g. --only 4stroke)")
     args, _ = ap.parse_known_args()
 
     try:
@@ -49,6 +52,8 @@ def main():
     assert bank._rclone_ready(), "no rclone/credentials"
     remote = f"{bank.REMOTE}:{RUNS_FOLDER}"
     runs = [d["Name"] for d in lsjson(remote) if d.get("IsDir")]
+    if args.only:
+        runs = [r for r in runs if args.only in r]
     print(f"[bench_all] {len(runs)} run(s) on the bank: {runs}", flush=True)
 
     # result file -> the command that produces it (run from repo root)
