@@ -39,7 +39,7 @@ def fourstroke_cfg():
                      fs_n_machines=16, fs_d_machine=256, fs_n_head_m=4,
                      fs_backend="swa", fs_window=128,
                      fs_topk=4, fs_loop_rounds=2, fs_loop_topk=4,
-                     fs_conf_sink=True, fs_tkv_heads=16, fs_mlp_depth=2,
+                     fs_conf_sink=True, fs_tkv_heads=16, fs_mlp_depth=1,
                      fs_sparse_state=True, **SPEEDRUN)
 
 

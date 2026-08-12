@@ -375,7 +375,9 @@ class MachineStrokes(nn.Module):
         # k also caps the write-back gates. Routed pairs' refresh is scaled
         # by the router sigmoid (its gradient path).
         self.topk = cfg.fs_topk
-        if self.topk:
+        self.rounds = cfg.fs_loop_rounds
+        self.loop_topk = cfg.fs_loop_topk
+        if self.topk or (self.rounds > 1 and self.loop_topk):
             self.route_x = nn.Parameter(torch.randn(K, C) * 0.02)
             self.route_c = nn.Parameter(torch.randn(K, d) * 0.02)
             self.route_b = nn.Parameter(torch.zeros(K))
@@ -386,19 +388,16 @@ class MachineStrokes(nn.Module):
         self.conf_sink = (nn.Parameter(torch.zeros(cfg.fs_n_head_m))
                           if cfg.fs_conf_sink else None)
         # loop (fs_loop_rounds R > 1): strokes 1-4 iterate on state with
-        # tied weights and frozen token k/v; rounds >= 2 apply a learned
-        # per-machine "still thinking" sigmoid on the state delta
-        # (relative-magnitude halting, differentiable), optionally
-        # top-fs_loop_topk machines per token per round.
-        self.rounds = cfg.fs_loop_rounds
-        self.loop_topk = cfg.fs_loop_topk
+        # tied weights and frozen token k/v; EVERY round re-runs the
+        # router on the freshly updated states. Predict-before-work, so
+        # rounds >= 2 are skippable on silicon: "not re-picked" IS the
+        # halting decision, and a machine can be woken mid-block by
+        # another machine's round-1 state. fs_loop_topk sets the k for
+        # rounds >= 2 (0 -> reuse fs_topk).
         # fs_sparse_state: conference reads are transient — only ROUTED
         # pairs absorb the round into persistent state; sleepers stay
         # bit-frozen (readable, never drifting)
         self.sparse_state = getattr(cfg, "fs_sparse_state", False)
-        if self.rounds > 1:
-            self.loop_w = nn.Parameter(torch.zeros(K, d))
-            self.loop_b = nn.Parameter(torch.full((K,), 2.0))
 
     def init_channel(self, B, T, device=None, dtype=None):
         """Seed conclusions for the first machine block: s0 at every t."""
@@ -439,34 +438,31 @@ class MachineStrokes(nn.Module):
         B, T, C = x.shape
         K = self.K
         tok_kv = self.backend.prep(x)                     # once per block
-        route = None
-        if self.topk:
-            r_log = (torch.einsum("btc,kc->btk", x, self.route_x)
-                     + torch.einsum("bktd,kd->btk", c_prev, self.route_c)
-                     + self.route_b)
-            r_gate = self._topk_mask(torch.sigmoid(r_log), self.topk)
-            route = r_gate.permute(0, 2, 1)[..., None]    # (B,K,T,1)
-            with torch.no_grad():
-                f = (r_gate > 0).float().mean(dim=(0, 1))  # traffic frac
-            p = torch.sigmoid(r_log).mean(dim=(0, 1))      # router mass
-            self.lb_loss = K * (f * p).sum()               # Switch-style
         c = c_prev
+        lb = []
         for r in range(self.rounds):
+            # fresh routing decision every round, from the states as they
+            # now stand — the router IS the halting gate for rounds >= 2
+            k_r = self.topk if r == 0 else (self.loop_topk or self.topk)
+            route = None
+            if k_r:
+                r_log = (torch.einsum("btc,kc->btk", x, self.route_x)
+                         + torch.einsum("bktd,kd->btk", c, self.route_c)
+                         + self.route_b)
+                r_gate = self._topk_mask(torch.sigmoid(r_log), k_r)
+                route = r_gate.permute(0, 2, 1)[..., None]  # (B,K,T,1)
+                with torch.no_grad():
+                    f = (r_gate > 0).float().mean(dim=(0, 1))  # traffic
+                p = torch.sigmoid(r_log).mean(dim=(0, 1))      # mass
+                lb.append(K * (f * p).sum())               # Switch-style
             s = self.backend.step(tok_kv, c)              # stroke 1
             if route is not None:
                 s = c + route * (s - c)     # unrouted: state passes through
             cand = self._confer(s)
             if self.sparse_state and route is not None:
                 cand = c + route * (cand - c)
-            if r == 0:
-                c = cand
-            else:
-                u = torch.sigmoid(                        # still thinking?
-                    torch.einsum("bktd,kd->btk", cand, self.loop_w)
-                    + self.loop_b)
-                if self.loop_topk:
-                    u = self._topk_mask(u, self.loop_topk)
-                c = c + u.permute(0, 2, 1)[..., None] * (cand - c)
+            c = cand
+        self.lb_loss = sum(lb) / len(lb) if lb else None
         g = torch.sigmoid(                                # stroke 4
             torch.einsum("btc,kc->btk", x, self.gate_x)
             + torch.einsum("bktd,kd->btk", c, self.gate_c)
@@ -513,10 +509,11 @@ def fourstroke_score_flops(cfg, T):
         and the write-back w_o that 6*N already billed
       - w_tkv is NOT discounted: token k/v are computed once per block
         for all machines regardless of routing (and reused by loops)
-      + rounds 2..R re-spend, per round: routed intake (params + scores),
-        the dense publish/conference (w_qkv, conf_out, scores). Charged at
-        the full routed fraction even when fs_loop_topk < topk
-        (conservative: the halting gate's savings are not credited)."""
+      + rounds 2..R re-spend, per round, at the ROUND'S routed fraction
+        (fs_loop_topk, falling back to fs_topk): intake params + scores,
+        and the publish apply for movers. The router re-runs each round
+        BEFORE the work, so these savings are real skips, not accounting.
+        Conference scores stay dense (all K readable every round)."""
     K, d, w, C = (cfg.fs_n_machines, cfg.fs_d_machine, cfg.fs_window,
                   cfg.n_embd)
     if cfg.fs_backend == "attn":
@@ -525,7 +522,8 @@ def fourstroke_score_flops(cfg, T):
         avg = T if T <= w else (w * (w + 1) / 2 + (T - w) * w) / T
     frac = (cfg.fs_topk / K) if cfg.fs_topk else 1.0
     mult, depth = cfg.fs_mlp_mult, cfg.fs_mlp_depth
-    intake_scores = K * 12 * d * 2 * avg * frac
+    intake_base = K * 12 * d * 2 * avg
+    intake_scores = intake_base * frac
     conf_scores = K * 12 * d * K
     mlp_p = 2 * mult * d * d + (depth - 1) * (mult * d) ** 2
     p_intake = K * (d * d + 2 * d * d + d * d          # w_q, w_pkv, w_out
@@ -540,13 +538,13 @@ def fourstroke_score_flops(cfg, T):
     p_pub_apply = K * (3 * d * d + d * d)              # round-1 spend
     if cfg.fs_share_pub:
         score += 6 * (K - 1) * (3 * d * d + d * d)     # round 1 surcharge
-    # rounds >= 2: a machine re-publishes only if its state moved, and
-    # fs_loop_topk caps movers per token â€” unchanged machines' published
-    # k/v are bit-identical to last round's (cacheable), so re-publish is
-    # charged at the loop fraction; conference scores stay dense (all K
-    # remain readable every round).
-    loop_frac = (cfg.fs_loop_topk / K) if cfg.fs_loop_topk else 1.0
+    # rounds >= 2: the router re-picks fs_loop_topk (or fs_topk) movers
+    # per token BEFORE the round runs, so only movers spend intake and
+    # republish; sleepers' published k/v are bit-identical to last
+    # round's (cacheable, exact under fs_sparse_state). Conference
+    # scores stay dense: all K remain readable every round.
+    loop_frac = (cfg.fs_loop_topk / K) if cfg.fs_loop_topk else frac
     score += ((cfg.fs_loop_rounds - 1)
-              * (6 * frac * p_intake + 6 * loop_frac * p_pub_apply
-                 + intake_scores + conf_scores))
+              * (6 * loop_frac * (p_intake + p_pub_apply)
+                 + intake_base * loop_frac + conf_scores))
     return score

@@ -387,21 +387,41 @@ def test_v2_gradients_reach_new_params():
     (y.square().mean() + c.square().mean()
      + blk.strokes.lb_loss).backward()
     s = blk.strokes
-    for name in ("route_x", "route_c", "route_b", "conf_sink",
-                 "loop_w", "loop_b"):
+    for name in ("route_x", "route_c", "route_b", "conf_sink"):
         p = getattr(s, name)
         assert p.grad is not None and p.grad.abs().sum() > 0, name
 
 
 def test_v2_loop_rounds_change_output():
+    # same seed -> identical params (the loop adds none); only the extra
+    # round separates them
     b1 = make_block(21, fs_loop_rounds=1)
     b2 = make_block(21, fs_loop_rounds=2)
-    # identical shared params; loop params exist only on b2
     torch.manual_seed(22)
     x = torch.randn(B, T, C, dtype=torch.float64)
     _, c1 = run(b1, x)
     _, c2 = run(b2, x)
     assert not torch.equal(c1, c2)
+
+
+def test_v2_router_reruns_every_round():
+    """One routing decision per round (plus the final write gate): the
+    router sees the updated states, not a frozen round-1 roster."""
+    blk = make_block(31, **V2)                # rounds=3, topk=2, ltopk=2
+    torch.manual_seed(32)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    calls = []
+    orig = blk.strokes._topk_mask
+
+    def spy(v, k):
+        calls.append(k)
+        return orig(v, k)
+
+    blk.strokes._topk_mask = spy
+    run(blk, x)
+    assert len(calls) == V2["fs_loop_rounds"] + 1
+    assert calls == [V2["fs_topk"], V2["fs_loop_topk"],
+                     V2["fs_loop_topk"], V2["fs_topk"]]
 
 
 def test_v2_flop_counter_discounts_and_charges():
