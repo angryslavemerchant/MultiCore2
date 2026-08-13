@@ -150,6 +150,9 @@ class GPTConfig:
                                # GEMM dispatch with this capacity factor
                                # (FCFS slots per machine, Switch-style
                                # position-order drops)
+    fs_grouped: bool = False   # Triton grouped-GEMM dispatch: dropless,
+                               # honors routing exactly (needs triton+GPU;
+                               # supersedes fs_capacity when set)
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)

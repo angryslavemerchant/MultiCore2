@@ -255,7 +255,7 @@ class AttnBackend(nn.Module):
             k_tok = apply_rope(k_tok, k_tok)[0]
         return k_tok, v_tok
 
-    def step(self, tok_kv, c_prev, disp=None):
+    def step(self, tok_kv, c_prev, disp=None, flat=None):
         """State-dependent intake + private MLP for one loop round.
 
         disp = (idx, valid, gate) switches on sparse GEMM dispatch: the
@@ -272,7 +272,16 @@ class AttnBackend(nn.Module):
         k_tok, v_tok = tok_kv
         k_prv, v_prv = self.w_pkv(self.ln_p(c_prev)).chunk(2, dim=-1)
         k_prv, v_prv = self._heads(k_prv), self._heads(v_prv)
-        if disp is None:
+        if flat is not None:
+            # grouped-GEMM path: flat rows sorted by machine, dropless
+            from core.grouped_gemm import grouped_mm
+            lin, offs, tg, tr, gate = flat
+            cflat = c_prev.reshape(B * K * T, d)
+            cg = cflat.index_select(0, lin)               # (n, d)
+            qg = grouped_mm(self.ln_q(cg), self.w_q.weight, offs, tg, tr)
+            q = self._heads(torch.zeros_like(cflat)
+                            .index_copy(0, lin, qg).view(B, K, T, d))
+        elif disp is None:
             q = self._heads(self.w_q(self.ln_q(c_prev)))
         else:
             idx, valid, gate = disp
@@ -292,6 +301,17 @@ class AttnBackend(nn.Module):
             mask = _intake_mask(T, None, k.device)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = (y.transpose(1, 2).reshape(B, K, T, d))
+        if flat is not None:
+            yg = y.reshape(B * K * T, d).index_select(0, lin)
+            sg = cg + grouped_mm(yg, self.w_out.weight, offs, tg, tr)
+            h = self.ln_mlp(sg)
+            h = F.relu(grouped_mm(h, self.mlp.fc.weight,
+                                  offs, tg, tr)).square()
+            for mid in self.mlp.mids:
+                h = F.relu(grouped_mm(h, mid.weight, offs, tg, tr)).square()
+            sg = sg + grouped_mm(h, self.mlp.proj.weight, offs, tg, tr)
+            sg = cg + gate * (sg - cg)                    # routed blend
+            return cflat.index_copy(0, lin, sg).view(B, K, T, d)
         if disp is None:
             s = c_prev + self.w_out(y)
             return s + self.mlp(self.ln_mlp(s))
@@ -431,6 +451,14 @@ class MachineStrokes(nn.Module):
         if self.capacity:
             assert self.topk or (self.rounds > 1 and self.loop_topk), \
                 "fs_capacity needs fs_topk (or fs_loop_topk) routing"
+        # fs_grouped: Triton grouped-GEMM dispatch — ALL routed rows in
+        # one flat buffer sorted by machine (ragged segments, dropless:
+        # the routing is honored exactly, no capacity, no overflow).
+        # Supersedes fs_capacity when both are set.
+        self.grouped = getattr(cfg, "fs_grouped", False)
+        if self.grouped:
+            assert self.topk or (self.rounds > 1 and self.loop_topk), \
+                "fs_grouped needs fs_topk (or fs_loop_topk) routing"
 
     def init_channel(self, B, T, device=None, dtype=None):
         """Seed conclusions for the first machine block: s0 at every t."""
@@ -443,6 +471,33 @@ class MachineStrokes(nn.Module):
         """Zero all but the top-k entries of v along its last dim."""
         kth = v.topk(k, dim=-1).values[..., -1:]
         return v * (v >= kth).to(v.dtype)
+
+    @staticmethod
+    def _flat_dispatch(r_log, k, K, block_m=64):
+        """Dropless flat dispatch for the grouped-GEMM path. Every
+        (token, machine) routed pair becomes one row of a flat buffer
+        SORTED BY MACHINE; segment g = machine g's rows. All shapes are
+        static (n = B*T*k always) — routing changes tensor contents,
+        never shapes, so torch.compile sees one graph.
+        Returns (lin, offs, tile_group, tile_row, gate):
+          lin  (n,) int64  row's index into the flattened (B*K*T, d) c
+          gate (n, 1)      router sigmoid of the row (gradient path)."""
+        B, T, _ = r_log.shape
+        vals, midx = torch.sigmoid(r_log).topk(k, dim=-1)  # (B,T,k)
+        i = torch.arange(B * T * k, device=r_log.device)
+        b, t = i // (T * k), (i // k) % T
+        m = midx.reshape(-1).to(torch.int64)
+        order = torch.argsort(m, stable=True)              # group by machine
+        m_s = m[order]
+        lin = ((b * K + m) * T + t)[order]
+        gate = vals.reshape(-1)[order][:, None]
+        counts = torch.bincount(m_s, minlength=K)
+        offs = torch.zeros(K + 1, dtype=torch.int32, device=r_log.device)
+        offs[1:] = counts.cumsum(0).to(torch.int32)
+        from core.grouped_gemm import build_tile_map
+        n = B * T * k
+        tg, tr = build_tile_map(offs, block_m, n // block_m + K)
+        return lin, offs, tg, tr, gate
 
     @staticmethod
     def _dispatch_idx(r_gate, cap):
@@ -492,7 +547,7 @@ class MachineStrokes(nn.Module):
             # fresh routing decision every round, from the states as they
             # now stand — the router IS the halting gate for rounds >= 2
             k_r = self.topk if r == 0 else (self.loop_topk or self.topk)
-            route = disp = None
+            route = disp = flat = None
             if k_r:
                 r_log = (torch.einsum("btc,kc->btk", x, self.route_x)
                          + torch.einsum("bktd,kd->btk", c, self.route_c)
@@ -502,7 +557,12 @@ class MachineStrokes(nn.Module):
                     f = (r_gate > 0).float().mean(dim=(0, 1))  # traffic
                 p = torch.sigmoid(r_log).mean(dim=(0, 1))      # mass
                 lb.append(K * (f * p).sum())               # Switch-style
-                if self.capacity:
+                if self.grouped:
+                    # dropless: routing honored exactly, blends inside
+                    # step; route below only feeds the sparse_state blend
+                    flat = self._flat_dispatch(r_log, k_r, K)
+                    route = r_gate.permute(0, 2, 1)[..., None]
+                elif self.capacity:
                     cap = min(T, max(1, math.ceil(
                         self.capacity * T * k_r / K)))     # static shape
                     idx, valid = self._dispatch_idx(r_gate, cap)
@@ -515,8 +575,8 @@ class MachineStrokes(nn.Module):
                         2, idx, gate[..., 0] * disp[1][..., 0])[..., None]
                 else:
                     route = r_gate.permute(0, 2, 1)[..., None]  # (B,K,T,1)
-            s = self.backend.step(tok_kv, c, disp)        # stroke 1
-            if route is not None and disp is None:
+            s = self.backend.step(tok_kv, c, disp, flat)  # stroke 1
+            if route is not None and disp is None and flat is None:
                 s = c + route * (s - c)     # unrouted: state passes through
             cand = self._confer(s)
             if self.sparse_state and route is not None:

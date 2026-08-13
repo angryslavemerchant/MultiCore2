@@ -576,6 +576,51 @@ def test_dispatch_causality(backend):
     assert not torch.equal(c1[:, :, p:], c2[:, :, p:])
 
 
+try:
+    from core.grouped_gemm import HAS_TRITON
+except ImportError:
+    HAS_TRITON = False
+needs_triton = pytest.mark.skipif(
+    not (HAS_TRITON and torch.cuda.is_available()),
+    reason="needs CUDA + triton")
+
+
+@needs_triton
+def test_grouped_matches_dense_masked():
+    """fs_grouped is DROPLESS: same routing, same math as dense-masked,
+    different silicon — outputs must agree to accumulation tolerance
+    (fp32; the two paths order their reductions differently)."""
+    kw = dict(fs_topk=2, fs_loop_rounds=2, fs_loop_topk=2,
+              fs_conf_sink=True, fs_sparse_state=True)
+    b_dense = make_block(51, **kw).float().cuda()
+    b_group = make_block(51, fs_grouped=True, **kw).float().cuda()
+    torch.manual_seed(52)
+    x = torch.randn(B, T, C, device="cuda")
+    y1, c1 = run(b_dense, x)
+    y2, c2 = run(b_group, x)
+    assert (y1 - y2).abs().max().item() < 1e-3
+    assert (c1 - c2).abs().max().item() < 1e-3
+
+
+@needs_triton
+def test_grouped_gradients_flow():
+    kw = dict(fs_topk=2, fs_loop_rounds=2, fs_loop_topk=2,
+              fs_conf_sink=True, fs_sparse_state=True, fs_grouped=True)
+    blk = make_block(53, **kw).float().cuda()
+    torch.manual_seed(54)
+    x = torch.randn(B, T, C, device="cuda")
+    y, c = run(blk, x)
+    (y.square().mean() + c.square().mean()
+     + blk.strokes.lb_loss).backward()
+    s = blk.strokes
+    for name, p in (("route_x", s.route_x),
+                    ("w_q", s.backend.w_q.weight),
+                    ("mlp_fc", s.backend.mlp.fc.weight),
+                    ("mlp_proj", s.backend.mlp.proj.weight),
+                    ("w_out", s.backend.w_out.weight)):
+        assert p.grad is not None and p.grad.abs().sum() > 0, name
+
+
 def test_dispatch_gradients_flow():
     """Gather/scatter must not sever the gradient paths to the routed
     GEMMs or the router."""

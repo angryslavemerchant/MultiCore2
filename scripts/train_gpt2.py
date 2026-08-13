@@ -183,6 +183,9 @@ def parse_args():
     ap.add_argument("--fs-capacity", type=float, default=0.0,
                     help="four-stroke: sparse GEMM dispatch capacity "
                          "factor (0 = dense-masked execution)")
+    ap.add_argument("--fs-grouped", action="store_true",
+                    help="four-stroke: Triton grouped-GEMM dispatch "
+                         "(dropless)")
     ap.add_argument("--fs-addr-mix", type=float, default=1.0,
                     help="M layers: init of the anchor-vs-state key "
                          "mixing scalar")
@@ -371,6 +374,7 @@ def main():
                     fs_mlp_depth=args.fs_mlp_depth,
                     fs_sparse_state=args.fs_sparse_state,
                     fs_capacity=args.fs_capacity,
+                    fs_grouped=args.fs_grouped,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

@@ -33,7 +33,7 @@ def mimo_cfg():
                      attn_pattern="SSSFSSSFSSSF", **SPEEDRUN)
 
 
-def fourstroke_cfg(capacity=0.0):
+def fourstroke_cfg(capacity=0.0, grouped=False):
     return GPTConfig(n_layer=12, n_head=8, n_embd=512,
                      attn_pattern="MMMFMMMFMMMF",
                      fs_n_machines=16, fs_d_machine=256, fs_n_head_m=4,
@@ -41,7 +41,7 @@ def fourstroke_cfg(capacity=0.0):
                      fs_topk=4, fs_loop_rounds=2, fs_loop_topk=4,
                      fs_conf_sink=True, fs_tkv_heads=16, fs_mlp_depth=1,
                      fs_sparse_state=True, fs_capacity=capacity,
-                     **SPEEDRUN)
+                     fs_grouped=grouped, **SPEEDRUN)
 
 
 def bench(name, cfg, batch, steps, compile_model=True):
@@ -136,6 +136,8 @@ def main():
         bench("fs-dense", fourstroke_cfg(), args.batch, args.steps,
               not args.no_compile)
         bench("fs-disp", fourstroke_cfg(args.fs_capacity), args.batch,
+              args.steps, not args.no_compile)
+        bench("fs-group", fourstroke_cfg(grouped=True), args.batch,
               args.steps, not args.no_compile)
 
 
