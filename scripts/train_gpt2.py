@@ -348,7 +348,9 @@ def main():
                     recent_band=args.recent_band, pos=args.pos,
                     lb_coef=(args.lb_coef
                              if ("G" in args.attn_pattern
-                                 or "C" in args.attn_pattern) else 0.0),
+                                 or "C" in args.attn_pattern
+                                 or ("M" in args.attn_pattern
+                                     and args.fs_topk)) else 0.0),
                     hg_frac=args.hg_frac, hg_bneck=args.hg_bneck,
                     hg_mid=args.hg_mid, hg_round=args.hg_round,
                     cow_chains=args.cow_chains,
