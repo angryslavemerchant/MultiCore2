@@ -70,17 +70,19 @@ def consume(hook, rec, K):
         tot = gs.sum(-1).clamp_min(1e-8)
         for kk in (1, 2, 4):
             _acc(rec, f"route_top{kk}", (gs[:, :kk].sum(-1) / tot).sum())
-        # conference probs: hook sums over rounds; head-average
-        attn = hook.pop("attn")
-        n_r = max(1, hook.pop("attn_rounds", 1))
-        p = (attn / n_r).float().mean(dim=1)              # (B*T, K, K)
-        _acc(rec, "conf_ent",
-             (-(p.clamp_min(1e-9).log() * p).sum(-1)).sum(dim=0))  # (K,)
-        ps = p.sort(dim=-1, descending=True).values
-        for kk in (1, 2, 4):
-            _acc(rec, f"conf_top{kk}", ps[:, :, :kk].sum(-1).sum(dim=0))
-        _acc(rec, "conf_self",
-             p.diagonal(dim1=-2, dim2=-1).sum(dim=0))              # (K,)
+        # conference probs: hook sums over rounds; head-average. Absent
+        # when the conference is ablated (v3 probe rungs 1-2).
+        attn = hook.pop("attn", None)
+        if attn is not None:
+            n_r = max(1, hook.pop("attn_rounds", 1))
+            p = (attn / n_r).float().mean(dim=1)          # (B*T, K, K)
+            _acc(rec, "conf_ent",
+                 (-(p.clamp_min(1e-9).log() * p).sum(-1)).sum(dim=0))
+            ps = p.sort(dim=-1, descending=True).values
+            for kk in (1, 2, 4):
+                _acc(rec, f"conf_top{kk}", ps[:, :, :kk].sum(-1).sum(dim=0))
+            _acc(rec, "conf_self",
+                 p.diagonal(dim1=-2, dim2=-1).sum(dim=0))          # (K,)
         # write-back contribution vs the residual it lands on
         _acc(rec, "out_norm", hook.pop("wb_out_norm"))
         _acc(rec, "x_norm", hook.pop("wb_x_norm"))
@@ -114,17 +116,20 @@ def finalize(rec, strokes):
         "gate_mean_overall": float(mean.mean()),
         "route_top_mass": {str(kk): float(rec[f"route_top{kk}"] / n)
                            for kk in (1, 2, 4)},
-        "conf_entropy": (rec["conf_ent"] / n).tolist(),
-        "conf_entropy_uniform": math.log(K),
-        "conf_top_mass": {str(kk): (rec[f"conf_top{kk}"] / n).tolist()
-                          for kk in (1, 2, 4)},
-        "conf_self_mass": (rec["conf_self"] / n).tolist(),
         "writeback_over_x": float(rec["out_norm"] / rec["x_norm"]),
         "writeback_norm_per_machine": (rec["wo_norm"] / n).tolist(),
         "channel_norm_per_machine": (rec["c_norm"] / n).tolist(),
-        "addr_mix": strokes.addr_mix.detach().float().cpu().tolist(),
-        "gate_bias": strokes.gate_b.detach().float().cpu().tolist(),
     }
+    if "conf_ent" in rec:          # absent when conference is ablated
+        out["conf_entropy"] = (rec["conf_ent"] / n).tolist()
+        out["conf_entropy_uniform"] = math.log(K)
+        out["conf_top_mass"] = {str(kk): (rec[f"conf_top{kk}"] / n).tolist()
+                                for kk in (1, 2, 4)}
+        out["conf_self_mass"] = (rec["conf_self"] / n).tolist()
+    for name, attr in (("addr_mix", "addr_mix"), ("gate_bias", "gate_b")):
+        p = getattr(strokes, attr, None)   # absent on ablated probe rungs
+        if p is not None:
+            out[name] = p.detach().float().cpu().tolist()
     if "route_traffic" in rec:
         out["route_traffic_per_round"] = (rec["route_traffic"] / n).tolist()
         if "route_wake" in rec:
@@ -193,11 +198,14 @@ def main():
     }
     json.dump(report, open(out_path, "w"), indent=2)
     for li, blk in enumerate(report["blocks"]):
+        conf = ("  conf_ent "
+                f"{np.mean(blk['conf_entropy']):.2f}"
+                f"/{blk['conf_entropy_uniform']:.2f}"
+                if "conf_entropy" in blk else "  conf ablated")
         print(f"[diag_fs] block {li}: gate_mean {blk['gate_mean_overall']:.3f}"
               f"  wb/x {blk['writeback_over_x']:.4f}"
               f"  route_top4 {blk['route_top_mass']['4']:.3f}"
-              f"  conf_ent {np.mean(blk['conf_entropy']):.2f}"
-              f"/{blk['conf_entropy_uniform']:.2f}", flush=True)
+              + conf, flush=True)
     print(f"DIAG_FS_DONE {out_path}", flush=True)
 
 

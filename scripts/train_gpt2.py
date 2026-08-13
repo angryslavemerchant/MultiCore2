@@ -206,6 +206,13 @@ def parse_args():
                     help="D layers: train the first N steps DENSE (router "
                          "runs, aux losses on, no top-k mask), then "
                          "switch to fs-topk (anti-collapse)")
+    ap.add_argument("--fs-dm-no-mlp", action="store_true",
+                    help="D layers: ablate the private MLPs (probe rung)")
+    ap.add_argument("--fs-dm-no-conf", action="store_true",
+                    help="D layers: ablate the conference (probe rung)")
+    ap.add_argument("--fs-dm-no-gate", action="store_true",
+                    help="D layers: ablate the learned write gate — "
+                         "router value alone (MoM-style; probe rung)")
     # Frankenstein stack (all default off; see core/model.py)
     ap.add_argument("--norm", default="ln", choices=("ln", "rms"))
     ap.add_argument("--qk-norm", action="store_true")
@@ -402,6 +409,9 @@ def main():
                     fs_route_noise=args.fs_route_noise,
                     fs_zloss=(args.fs_zloss
                               if "D" in args.attn_pattern else 0.0),
+                    fs_dm_mlp=not args.fs_dm_no_mlp,
+                    fs_dm_conf=not args.fs_dm_no_conf,
+                    fs_dm_gate=not args.fs_dm_no_gate,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

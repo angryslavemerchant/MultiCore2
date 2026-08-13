@@ -223,6 +223,36 @@ def test_gpt_integration_and_aux_losses():
     assert model.flops_per_token(T) > 0
 
 
+RUNGS = [dict(fs_dm_mlp=False, fs_dm_conf=False, fs_dm_gate=False),
+         dict(fs_dm_conf=False, fs_dm_gate=False),
+         dict(fs_dm_gate=False),
+         dict()]
+
+
+def test_probe_rungs_all_params_reach_the_graph():
+    """Probe-ladder rungs 1-4: forward/backward runs and EVERY constructed
+    parameter gets a grad — DDP errors on orphans (the v2 s0 lesson), so
+    this is the single-process proxy for the 2x/8x path."""
+    for kw in RUNGS:
+        torch.manual_seed(20)
+        m = DeltaMachines(cfg(**kw)).double()
+        with torch.no_grad():
+            m.w_o.weight.normal_(0, 0.02)
+        x = torch.randn(B, T, C, dtype=torch.float64)
+        out = m(x)
+        (out.square().sum() + m.lb_loss + m.z_loss).backward()
+        for n, p in m.named_parameters():
+            assert p.grad is not None, (kw, n)
+
+
+def test_probe_rungs_flops_monotone():
+    """Each added part must cost FLOPs at the accounting layer (params
+    grow and the scorer charges/credits the parts that exist)."""
+    fs = [GPT(cfg(vocab_size=64, n_layer=2, attn_pattern="FD",
+                  **kw)).flops_per_token(T) for kw in RUNGS]
+    assert fs[0] < fs[1] < fs[2] < fs[3]
+
+
 def test_flops_scorer_prices_sparsity():
     dense = cfg(fs_topk=0)
     sparse = cfg(fs_topk=2)

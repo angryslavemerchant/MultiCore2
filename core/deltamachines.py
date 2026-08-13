@@ -142,21 +142,32 @@ class DeltaMachines(nn.Module):
         self.w_in = TokenLinear(K, C, 3 * d + 2 * H)
         self.ln_o = make_norm(cfg, d)
         self.w_out = MachineLinear(K, d, d)
-        self.mlp = MachineMLP(cfg)
-        self.ln_mlp = make_norm(cfg, d)
+        # probe-ladder ablations (fs_dm_*): rung 1 = plain-MoM substrate
+        # (memories only), +mlp, +conf, +gate = full v3. Disabled parts are
+        # NOT constructed — DDP errors on params that never touch the loss
+        # (the v2 orphaned-s0 lesson, 8x 2026-08-11).
+        self.use_mlp = getattr(cfg, "fs_dm_mlp", True)
+        self.use_conf = getattr(cfg, "fs_dm_conf", True)
+        self.use_gate = getattr(cfg, "fs_dm_gate", True)
+        if self.use_mlp:
+            self.mlp = MachineMLP(cfg)
+            self.ln_mlp = make_norm(cfg, d)
         # conference (identical bones to v2: anchor keys, addr_mix, sink)
-        self.anchor = nn.Parameter(torch.empty(K, d))
-        nn.init.orthogonal_(self.anchor)
-        self.addr_mix = nn.Parameter(torch.full((K,), cfg.fs_addr_mix))
-        self.ln_iface = make_norm(cfg, d)
-        self.w_qkv = MachineLinear(K, d, 3 * d)
-        self.conf_out = MachineLinear(K, d, d)
-        self.conf_sink = (nn.Parameter(torch.zeros(H))
-                          if cfg.fs_conf_sink else None)
-        # write-back gate on [x_t ; c_k], zero-init W_O
-        self.gate_x = nn.Parameter(torch.randn(K, C) * 0.02)
-        self.gate_c = nn.Parameter(torch.randn(K, d) * 0.02)
-        self.gate_b = nn.Parameter(torch.zeros(K))
+        if self.use_conf:
+            self.anchor = nn.Parameter(torch.empty(K, d))
+            nn.init.orthogonal_(self.anchor)
+            self.addr_mix = nn.Parameter(torch.full((K,), cfg.fs_addr_mix))
+            self.ln_iface = make_norm(cfg, d)
+            self.w_qkv = MachineLinear(K, d, 3 * d)
+            self.conf_out = MachineLinear(K, d, d)
+            self.conf_sink = (nn.Parameter(torch.zeros(H))
+                              if cfg.fs_conf_sink else None)
+        # write-back gate on [x_t ; c_k], zero-init W_O. Ungated rungs use
+        # the router value alone (MoM-style sum of routed reads).
+        if self.use_gate:
+            self.gate_x = nn.Parameter(torch.randn(K, C) * 0.02)
+            self.gate_c = nn.Parameter(torch.randn(K, d) * 0.02)
+            self.gate_b = nn.Parameter(torch.zeros(K))
         self.w_o = MachineLinear(K, d, C, zero=True)
         # router: predict-before-work from x alone. topk_now is the LIVE
         # k -- the trainer's dense->sparse warmup sets it to 0 (dense,
@@ -281,14 +292,19 @@ class DeltaMachines(nn.Module):
         o = (o.view(B, K, self.H, T, self.hd).permute(0, 1, 3, 2, 4)
              .reshape(B, K, T, d))
         s = self.w_out(self.ln_o(o))
-        s = s + self.mlp(self.ln_mlp(s))
-        c = self._confer(s, mask, diag)
-        g = torch.sigmoid(
-            torch.einsum("btc,kc->btk", x, self.gate_x)
-            + torch.einsum("bktd,kd->btk", c, self.gate_c)
-            + self.gate_b)
-        if r_gate is not None:
-            g = g * r_gate
+        if self.use_mlp:
+            s = s + self.mlp(self.ln_mlp(s))
+        c = self._confer(s, mask, diag) if self.use_conf else s
+        if self.use_gate:
+            g = torch.sigmoid(
+                torch.einsum("btc,kc->btk", x, self.gate_x)
+                + torch.einsum("bktd,kd->btk", c, self.gate_c)
+                + self.gate_b)
+            if r_gate is not None:
+                g = g * r_gate
+        else:
+            g = (r_gate if r_gate is not None
+                 else x.new_ones(B, T, K))    # MoM-style routed sum
         if (ctl is not None
                 and getattr(ctl, "mute_write", None) is not None):
             g = g.clone()
@@ -351,13 +367,17 @@ def deltamachines_score_flops(cfg, T):
     hd = d // H
     frac = (cfg.fs_topk / K) if cfg.fs_topk else 1.0
     k_act = cfg.fs_topk or K
-    mlp_p = (2 * cfg.fs_mlp_mult * d * d
-             + (cfg.fs_mlp_depth - 1) * (cfg.fs_mlp_mult * d) ** 2)
+    mlp_p = ((2 * cfg.fs_mlp_mult * d * d
+              + (cfg.fs_mlp_depth - 1) * (cfg.fs_mlp_mult * d) ** 2)
+             if getattr(cfg, "fs_dm_mlp", True) else 0)
+    conf_p = (4 * d * d if getattr(cfg, "fs_dm_conf", True) else 0)
     p_priv = (C * (3 * d + 2 * H)      # w_in
-              + d * d + mlp_p          # w_out, private MLP
-              + 3 * d * d + d * d      # conference w_qkv, conf_out
+              + d * d + mlp_p          # w_out, private MLP (if built)
+              + conf_p                 # conference w_qkv+conf_out (if built)
               + d * C)                 # w_o
     scan = 12 * d * cfg.fs_chunk + 18 * d * hd
-    score = K * frac * scan + 12 * d * k_act * k_act
+    score = K * frac * scan
+    if getattr(cfg, "fs_dm_conf", True):
+        score += 12 * d * k_act * k_act
     score -= 6 * (1 - frac) * K * p_priv
     return score

@@ -170,6 +170,11 @@ class GPTConfig:
                                # stream feeding machine projections; 0=off
     fs_route_noise: float = 0.0  # train-time router logit noise std
     fs_zloss: float = 0.0      # router z-loss coefficient (0 disables)
+    # probe-ladder ablations: rung 1 (plain-MoM substrate) turns all three
+    # off; +mlp, +conf, +gate = full v3. Disabled parts are not built.
+    fs_dm_mlp: bool = True     # private per-machine MLPs
+    fs_dm_conf: bool = True    # conference over active views
+    fs_dm_gate: bool = True    # learned write gate (off = router value)
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
