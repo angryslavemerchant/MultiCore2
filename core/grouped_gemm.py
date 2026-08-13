@@ -181,29 +181,53 @@ if HAS_TRITON:
         return dw
 
 
-class _GroupedMM(torch.autograd.Function):
-    """y[a:b] = x[a:b] @ w[g] per segment. block_m of the tile map and
-    the forward launch must agree (build_tile_map(block_m=64))."""
+if HAS_TRITON:
+    # Registered as torch custom ops so torch.compile treats the launches
+    # as OPAQUE graph nodes: dynamo must neither trace into the triton
+    # source (it can't -- verified NaN corruption on 2026-08-13 when it
+    # tried) nor graph-break around every launch (48 breaks per step).
+    # register_fake gives inductor the shape/dtype contract it needs to
+    # keep compiling the surrounding graph.
 
-    @staticmethod
-    def forward(ctx, x, w, offsets, tile_group, tile_row):
-        ctx.save_for_backward(x, w, offsets, tile_group, tile_row)
+    @torch.library.custom_op("multicore::grouped_mm", mutates_args=())
+    def _op_mm(x: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor,
+               tile_group: torch.Tensor,
+               tile_row: torch.Tensor) -> torch.Tensor:
         return _launch_mm(x, w, offsets, tile_group, tile_row)
 
-    @staticmethod
-    def backward(ctx, dy):
+    @_op_mm.register_fake
+    def _op_mm_fake(x, w, offsets, tile_group, tile_row):
+        return x.new_empty(x.shape[0], w.shape[2])
+
+    @torch.library.custom_op("multicore::grouped_dw", mutates_args=())
+    def _op_dw(x: torch.Tensor, dy: torch.Tensor, offsets: torch.Tensor,
+               n_groups: int) -> torch.Tensor:
+        return _launch_dw(x, dy, offsets, n_groups)
+
+    @_op_dw.register_fake
+    def _op_dw_fake(x, dy, offsets, n_groups):
+        return x.new_empty(n_groups, x.shape[1], dy.shape[1])
+
+    def _setup_ctx(ctx, inputs, output):
+        x, w, offsets, tile_group, tile_row = inputs
+        ctx.save_for_backward(x, w, offsets, tile_group, tile_row)
+
+    def _backward(ctx, dy):
         x, w, offsets, tile_group, tile_row = ctx.saved_tensors
         dy = dy.contiguous()
-        # dx = dy @ w^T -- same segments, same tile map, swapped strides
-        # via an explicit transpose-copy (K*d_in*d_out*2B, ~8 MB at our
-        # shapes; negligible next to the GEMMs it feeds).
-        dx = _launch_mm(dy, w.transpose(1, 2).contiguous(), offsets,
-                        tile_group, tile_row)
-        dw = _launch_dw(x, dy, offsets, w.shape[0])
+        # dx = dy @ w^T -- same segments, same tile map; the transpose
+        # copy is K*d_in*d_out*2B (~8 MB at our shapes), negligible.
+        dx = _op_mm(dy, w.transpose(1, 2).contiguous(), offsets,
+                    tile_group, tile_row)
+        dw = _op_dw(x, dy, offsets, w.shape[0])
         return dx, dw, None, None, None
+
+    _op_mm.register_autograd(_backward, setup_context=_setup_ctx)
 
 
 def grouped_mm(x, w, offsets, tile_group, tile_row):
+    """y[a:b] = x[a:b] @ w[g] per segment; block_m of the tile map and
+    the kernel launch must agree (build_tile_map(block_m=64))."""
     if not HAS_TRITON:
         raise RuntimeError("triton not available; use grouped_mm_reference")
-    return _GroupedMM.apply(x, w, offsets, tile_group, tile_row)
+    return _op_mm(x, w, offsets, tile_group, tile_row)
