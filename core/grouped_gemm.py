@@ -253,7 +253,18 @@ if HAS_TRITON:
 
 def grouped_mm(x, w, offsets, tile_group, tile_row):
     """y[a:b] = x[a:b] @ w[g] per segment; block_m of the tile map and
-    the kernel launch must agree (build_tile_map(block_m=64))."""
+    the kernel launch must agree (build_tile_map(block_m=64)).
+
+    Autocast: custom ops bypass amp's casting, so under autocast the
+    trainer hands us bf16 activations and fp32 master weights and
+    tl.dot refuses mixed dtypes (8x crash 2026-08-13). Cast both to
+    the autocast dtype here, like a real matmul would be — the .to()
+    is autograd-tracked, so fp32 params still receive fp32 grads."""
     if not HAS_TRITON:
         raise RuntimeError("triton not available; use grouped_mm_reference")
+    if torch.is_autocast_enabled("cuda"):
+        dt = torch.get_autocast_dtype("cuda")
+        x, w = x.to(dt), w.to(dt)
+    elif x.dtype != w.dtype:
+        w = w.to(x.dtype)
     return _op_mm(x, w, offsets, tile_group, tile_row)

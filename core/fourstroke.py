@@ -280,7 +280,8 @@ class AttnBackend(nn.Module):
             cg = cflat.index_select(0, lin)               # (n, d)
             qg = grouped_mm(self.ln_q(cg), self.w_q.weight, offs, tg, tr)
             q = self._heads(torch.zeros_like(cflat)
-                            .index_copy(0, lin, qg).view(B, K, T, d))
+                            .index_copy(0, lin, qg.to(cflat.dtype))
+                            .view(B, K, T, d))
         elif disp is None:
             q = self._heads(self.w_q(self.ln_q(c_prev)))
         else:

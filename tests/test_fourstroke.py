@@ -621,6 +621,25 @@ def test_grouped_gradients_flow():
         assert p.grad is not None and p.grad.abs().sum() > 0, name
 
 
+@needs_triton
+def test_grouped_autocast_mixed_dtypes():
+    """The trainer's real setup: fp32 master params + autocast
+    activations. Custom ops bypass amp casting — the 8x launch crashed
+    on bf16-x/fp32-w inside tl.dot (2026-08-13). fp16 here so the test
+    also runs on sm75."""
+    kw = dict(fs_topk=2, fs_loop_rounds=2, fs_loop_topk=2,
+              fs_conf_sink=True, fs_sparse_state=True, fs_grouped=True)
+    blk = make_block(55, **kw).float().cuda()
+    torch.manual_seed(56)
+    x = torch.randn(B, T, C, device="cuda")
+    with torch.autocast("cuda", dtype=torch.float16):
+        y, c = run(blk, x)
+    (y.float().square().mean() + c.float().square().mean()).backward()
+    p = blk.strokes.backend.w_q.weight
+    assert p.grad is not None and p.grad.dtype == torch.float32
+    assert p.grad.abs().sum() > 0
+
+
 def test_ckpt_matches_uncheckpointed():
     """fs_ckpt recomputes the SAME math in backward: loss and gradients
     must be exactly equal to the stored-activation path (float64 CPU),
