@@ -112,7 +112,7 @@ def check_compiled_numerics(capacity=0.0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="both",
-                    choices=("mimo", "fourstroke", "both"))
+                    choices=("mimo", "fourstroke", "grouped", "both"))
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--no-compile", action="store_true")
@@ -137,6 +137,9 @@ def main():
               not args.no_compile)
         bench("fs-disp", fourstroke_cfg(args.fs_capacity), args.batch,
               args.steps, not args.no_compile)
+        bench("fs-group", fourstroke_cfg(grouped=True), args.batch,
+              args.steps, not args.no_compile)
+    if args.arch == "grouped":                 # e.g. micro-bs 2 probe
         bench("fs-group", fourstroke_cfg(grouped=True), args.batch,
               args.steps, not args.no_compile)
 
