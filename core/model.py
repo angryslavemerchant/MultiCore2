@@ -153,6 +153,11 @@ class GPTConfig:
     fs_grouped: bool = False   # Triton grouped-GEMM dispatch: dropless,
                                # honors routing exactly (needs triton+GPU;
                                # supersedes fs_capacity when set)
+    fs_ckpt: bool = False      # activation-checkpoint the M blocks: the
+                               # (B,K,T,d_m) intermediates are the memory
+                               # bill of the population — recompute them
+                               # in backward instead of storing (~1 extra
+                               # M fwd; buys micro-batch headroom)
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
@@ -541,12 +546,31 @@ class GPT(nn.Module):
             x = x + self.transformer.wpe(pos)
         x = self.transformer.drop(x)
         chan = None   # machine channel, threaded between M blocks
+        # lb_loss must be an OUTPUT of the checkpointed region (a tensor
+        # stashed on the module from inside the region would reference
+        # discarded intermediates); has_lb mirrors the router condition
+        # in MachineStrokes.__init__.
+        use_ckpt = (self.cfg.fs_ckpt and self.training
+                    and torch.is_grad_enabled())
+        has_lb = bool(self.cfg.fs_topk or (self.cfg.fs_loop_rounds > 1
+                                           and self.cfg.fs_loop_topk))
         for block in self.transformer.h:
             if hasattr(block, "strokes"):
                 if chan is None:
                     chan = block.strokes.init_channel(
                         B, T, device=x.device, dtype=x.dtype)
-                x, chan = block(x, chan)
+                if use_ckpt:
+                    def run(x, chan, blk=block):
+                        y, c = blk(x, chan)
+                        lb = blk.strokes.lb_loss
+                        return y, c, (lb if lb is not None
+                                      else x.new_zeros(()))
+                    x, chan, lb = torch.utils.checkpoint.checkpoint(
+                        run, x, chan, use_reentrant=False)
+                    if has_lb:
+                        block.strokes.lb_loss = lb
+                else:
+                    x, chan = block(x, chan)
             else:
                 x = block(x)
         x = self.transformer.ln_f(x)

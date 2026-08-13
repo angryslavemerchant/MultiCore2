@@ -621,6 +621,31 @@ def test_grouped_gradients_flow():
         assert p.grad is not None and p.grad.abs().sum() > 0, name
 
 
+def test_ckpt_matches_uncheckpointed():
+    """fs_ckpt recomputes the SAME math in backward: loss and gradients
+    must be exactly equal to the stored-activation path (float64 CPU),
+    including the lb_loss aux term threaded out of the region."""
+    kw = dict(block_size=T, vocab_size=64, n_layer=2, n_head=4, n_embd=C,
+              attn_pattern="MF", fs_n_machines=3, fs_d_machine=16,
+              fs_n_head_m=2, fs_mlp_mult=2, fs_backend="attn",
+              fs_window=4, fs_topk=2, fs_loop_rounds=2, fs_loop_topk=2,
+              fs_sparse_state=True, lb_coef=0.01)
+    losses, grads = [], []
+    for ckpt in (False, True):
+        torch.manual_seed(61)
+        m = GPT(GPTConfig(fs_ckpt=ckpt, **kw)).double()
+        m.train()
+        torch.manual_seed(62)
+        idx = torch.randint(0, 64, (B, T))
+        _, loss = m(idx, idx)
+        loss.backward()
+        losses.append(loss.detach())
+        grads.append(m.transformer.h[0].strokes.backend.w_q.weight
+                     .grad.clone())
+    assert torch.equal(losses[0], losses[1])
+    assert torch.equal(grads[0], grads[1])
+
+
 def test_dispatch_gradients_flow():
     """Gather/scatter must not sever the gradient paths to the routed
     GEMMs or the router."""

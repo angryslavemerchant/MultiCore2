@@ -90,6 +90,18 @@ def grouped_mm_reference(x, w, offsets):
 
 if HAS_TRITON:
 
+    # Autotune over tile shapes: our segments are ~1-5k rows x 256-1024
+    # features, small enough that the best tile is not the textbook one.
+    # BLOCK_M is FIXED at 64 -- the host-side tile map is built with
+    # block_m=64 and the kernel's row tiling must agree with it.
+    _MM_CONFIGS = [
+        triton.Config({"BLOCK_N": bn, "BLOCK_K": bk},
+                      num_warps=w, num_stages=s)
+        for bn in (64, 128) for bk in (32, 64)
+        for w, s in ((4, 2), (4, 3), (8, 3))
+    ]
+
+    @triton.autotune(configs=_MM_CONFIGS, key=["d_in", "d_out"])
     @triton.jit
     def _grouped_mm_kernel(
         x_ptr, w_ptr, y_ptr, tile_group_ptr, tile_row_ptr, offs_ptr,
@@ -122,6 +134,15 @@ if HAS_TRITON:
                  acc.to(y_ptr.dtype.element_ty),
                  mask=rmask[:, None] & cmask[None, :])
 
+    _DW_CONFIGS = [
+        triton.Config({"BLOCK_I": bi, "BLOCK_O": bo, "BLOCK_R": br},
+                      num_warps=w, num_stages=s)
+        for bi, bo in ((64, 64), (64, 128), (128, 64))
+        for br in (32, 64)
+        for w, s in ((4, 2), (8, 3))
+    ]
+
+    @triton.autotune(configs=_DW_CONFIGS, key=["d_in", "d_out"])
     @triton.jit
     def _grouped_dw_kernel(
         x_ptr, dy_ptr, dw_ptr, offs_ptr,
@@ -151,33 +172,38 @@ if HAS_TRITON:
                  acc.to(dw_ptr.dtype.element_ty),
                  mask=imask[:, None] & omask[None, :])
 
-    def _launch_mm(x, w, offsets, tile_group, tile_row,
-                   block_m=64, block_n=64, block_k=32):
+    def _launch_mm(x, w, offsets, tile_group, tile_row, block_m=64):
         N, d_in = x.shape
         d_out = w.shape[2]
         y = x.new_empty(N, d_out)
-        grid = (tile_group.numel(), triton.cdiv(d_out, block_n))
+
+        def grid(meta):
+            return (tile_group.numel(),
+                    triton.cdiv(d_out, meta["BLOCK_N"]))
+
         _grouped_mm_kernel[grid](
             x, w, y, tile_group, tile_row, offsets,
             d_in, d_out,
             x.stride(0), x.stride(1),
             w.stride(0), w.stride(1), w.stride(2),
             y.stride(0), y.stride(1),
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k)
+            BLOCK_M=block_m)
         return y
 
-    def _launch_dw(x, dy, offsets, K,
-                   block_i=64, block_o=64, block_r=32):
+    def _launch_dw(x, dy, offsets, K):
         d_in, d_out = x.shape[1], dy.shape[1]
         dw = x.new_zeros(K, d_in, d_out)
-        grid = (K, triton.cdiv(d_in, block_i), triton.cdiv(d_out, block_o))
+
+        def grid(meta):
+            return (K, triton.cdiv(d_in, meta["BLOCK_I"]),
+                    triton.cdiv(d_out, meta["BLOCK_O"]))
+
         _grouped_dw_kernel[grid](
             x, dy, dw, offsets,
             d_in, d_out,
             x.stride(0), x.stride(1),
             dy.stride(0), dy.stride(1),
-            dw.stride(0), dw.stride(1), dw.stride(2),
-            BLOCK_I=block_i, BLOCK_O=block_o, BLOCK_R=block_r)
+            dw.stride(0), dw.stride(1), dw.stride(2))
         return dw
 
 

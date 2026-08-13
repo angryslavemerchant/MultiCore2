@@ -33,7 +33,7 @@ def mimo_cfg():
                      attn_pattern="SSSFSSSFSSSF", **SPEEDRUN)
 
 
-def fourstroke_cfg(capacity=0.0, grouped=False):
+def fourstroke_cfg(capacity=0.0, grouped=False, ckpt=False):
     return GPTConfig(n_layer=12, n_head=8, n_embd=512,
                      attn_pattern="MMMFMMMFMMMF",
                      fs_n_machines=16, fs_d_machine=256, fs_n_head_m=4,
@@ -41,7 +41,7 @@ def fourstroke_cfg(capacity=0.0, grouped=False):
                      fs_topk=4, fs_loop_rounds=2, fs_loop_topk=4,
                      fs_conf_sink=True, fs_tkv_heads=16, fs_mlp_depth=1,
                      fs_sparse_state=True, fs_capacity=capacity,
-                     fs_grouped=grouped, **SPEEDRUN)
+                     fs_grouped=grouped, fs_ckpt=ckpt, **SPEEDRUN)
 
 
 def bench(name, cfg, batch, steps, compile_model=True):
@@ -120,6 +120,8 @@ def main():
                     help="compiled-vs-eager numerics only")
     ap.add_argument("--fs-capacity", type=float, default=1.25,
                     help="capacity factor for the dispatch arm")
+    ap.add_argument("--fs-ckpt", action="store_true",
+                    help="activation-checkpoint M blocks (grouped arch)")
     args = ap.parse_args()
     print(torch.cuda.get_device_name(0), flush=True)
     if args.check:
@@ -140,8 +142,9 @@ def main():
         bench("fs-group", fourstroke_cfg(grouped=True), args.batch,
               args.steps, not args.no_compile)
     if args.arch == "grouped":                 # e.g. micro-bs 2 probe
-        bench("fs-group", fourstroke_cfg(grouped=True), args.batch,
-              args.steps, not args.no_compile)
+        bench("fs-group" + ("-ckpt" if args.fs_ckpt else ""),
+              fourstroke_cfg(grouped=True, ckpt=args.fs_ckpt),
+              args.batch, args.steps, not args.no_compile)
 
 
 if __name__ == "__main__":
