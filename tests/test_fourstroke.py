@@ -519,3 +519,75 @@ def test_v2_sparse_state_freezes_sleepers():
     _, c = blk(x, c0)
     assert torch.equal(c[:, 1:], c0[:, 1:])       # sleepers frozen
     assert not torch.equal(c[:, :1], c0[:, :1])   # routed machine moved
+
+
+# ------------------------------------------------------- sparse dispatch
+
+DISP = dict(fs_topk=2, fs_loop_rounds=2, fs_loop_topk=2, fs_conf_sink=True,
+            fs_sparse_state=True)
+
+
+@pytest.mark.parametrize("backend", ["attn", "swa"])
+def test_dispatch_matches_dense_at_full_capacity(backend):
+    """With buffers big enough to never overflow, gathered execution is
+    BIT-IDENTICAL to dense-masked: same math, different silicon."""
+    b_dense = make_block(41, fs_backend=backend, **DISP)
+    b_disp = make_block(41, fs_backend=backend, fs_capacity=3.0, **DISP)
+    torch.manual_seed(42)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y1, c1 = run(b_dense, x)
+    y2, c2 = run(b_disp, x)
+    assert torch.equal(y1, y2) and torch.equal(c1, c2)
+
+
+def test_dispatch_drops_overflow_to_passthrough():
+    """FCFS capacity: with 2 slots and every token routed to machine 0,
+    only the first two tokens get refreshed; overflow tokens fall back to
+    pass-through, exactly the unrouted path."""
+    blk = make_block(43, fs_topk=1, fs_capacity=0.75)   # cap = 2 of T = 8
+    with torch.no_grad():
+        blk.strokes.conf_out.weight.zero_()
+        blk.strokes.route_x.zero_()
+        blk.strokes.route_c.zero_()
+        blk.strokes.route_b.copy_(torch.tensor([10.0, -10.0, -10.0]))
+    torch.manual_seed(44)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    c0 = blk.strokes.init_channel(B, T, dtype=torch.float64)
+    _, c = blk(x, c0)
+    assert not torch.equal(c[:, 0, :2], c0[:, 0, :2])   # claimed slots moved
+    assert torch.equal(c[:, 0, 2:], c0[:, 0, 2:])       # overflow dropped
+    assert torch.equal(c[:, 1:], c0[:, 1:])             # unrouted machines
+
+
+@pytest.mark.parametrize("backend", ["attn", "swa"])
+def test_dispatch_causality(backend):
+    """Exact causality with finite capacity (drops active): FCFS slot
+    claims depend only on earlier tokens."""
+    blk = make_block(45, fs_backend=backend, fs_capacity=1.25, **DISP)
+    torch.manual_seed(46)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    p = 5
+    x2 = x.clone()
+    x2[:, p] += torch.randn(C, dtype=torch.float64)
+    y1, c1 = run(blk, x)
+    y2, c2 = run(blk, x2)
+    assert torch.equal(y1[:, :p], y2[:, :p])
+    assert torch.equal(c1[:, :, :p], c2[:, :, :p])
+    assert not torch.equal(c1[:, :, p:], c2[:, :, p:])
+
+
+def test_dispatch_gradients_flow():
+    """Gather/scatter must not sever the gradient paths to the routed
+    GEMMs or the router."""
+    blk = make_block(47, fs_capacity=1.25, **DISP)
+    torch.manual_seed(48)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y, c = run(blk, x)
+    (y.square().mean() + c.square().mean()
+     + blk.strokes.lb_loss).backward()
+    s = blk.strokes
+    for name, p in (("route_x", s.route_x),
+                    ("w_q", s.backend.w_q.weight),
+                    ("mlp_fc", s.backend.mlp.fc.weight),
+                    ("w_out", s.backend.w_out.weight)):
+        assert p.grad is not None and p.grad.abs().sum() > 0, name

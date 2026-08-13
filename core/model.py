@@ -146,6 +146,10 @@ class GPTConfig:
     fs_share_pub: bool = False  # share publish/conference projections
     fs_mlp_depth: int = 1      # hidden layers in the private MLP
     fs_sparse_state: bool = False  # only routed pairs absorb the round
+    fs_capacity: float = 0.0   # 0 = dense-masked execution; > 0 = sparse
+                               # GEMM dispatch with this capacity factor
+                               # (FCFS slots per machine, Switch-style
+                               # position-order drops)
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)

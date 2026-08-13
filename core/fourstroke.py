@@ -255,13 +255,32 @@ class AttnBackend(nn.Module):
             k_tok = apply_rope(k_tok, k_tok)[0]
         return k_tok, v_tok
 
-    def step(self, tok_kv, c_prev):
-        """State-dependent intake + private MLP for one loop round."""
+    def step(self, tok_kv, c_prev, disp=None):
+        """State-dependent intake + private MLP for one loop round.
+
+        disp = (idx, valid, gate) switches on sparse GEMM dispatch: the
+        per-(token, machine) GEMMs (w_q, w_out, MLP) run only on each
+        machine's gathered capacity buffer (B, K, cap, d); the private-
+        channel k/v stay DENSE (any position may be a key inside some
+        routed query's window) and the banded attention core stays dense
+        (queries at unclaimed slots are zeroed, their rows discarded —
+        attention output is per-query independent, so claimed rows are
+        bit-identical to the dense path). The routed blend
+        c + gate*(s - c) happens here on the buffer; the returned s has
+        pass-through built in for unrouted AND capacity-dropped pairs."""
         B, K, T, d = c_prev.shape
         k_tok, v_tok = tok_kv
-        q = self._heads(self.w_q(self.ln_q(c_prev)))
         k_prv, v_prv = self.w_pkv(self.ln_p(c_prev)).chunk(2, dim=-1)
         k_prv, v_prv = self._heads(k_prv), self._heads(v_prv)
+        if disp is None:
+            q = self._heads(self.w_q(self.ln_q(c_prev)))
+        else:
+            idx, valid, gate = disp
+            idx_d = idx[..., None].expand(-1, -1, -1, d)
+            cg = torch.gather(c_prev, 2, idx_d)           # (B,K,cap,d)
+            qg = self.w_q(self.ln_q(cg)) * valid
+            q = self._heads(
+                torch.zeros_like(c_prev).scatter(2, idx_d, qg))
         if self.use_rope:
             q = apply_rope(q, q)[0]
             k_prv = apply_rope(k_prv, k_prv)[0]
@@ -273,8 +292,14 @@ class AttnBackend(nn.Module):
             mask = _intake_mask(T, None, k.device)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = (y.transpose(1, 2).reshape(B, K, T, d))
-        s = c_prev + self.w_out(y)
-        return s + self.mlp(self.ln_mlp(s))
+        if disp is None:
+            s = c_prev + self.w_out(y)
+            return s + self.mlp(self.ln_mlp(s))
+        yg = torch.gather(y, 2, idx_d)
+        sg = cg + self.w_out(yg)
+        sg = sg + self.mlp(self.ln_mlp(sg))
+        sg = cg + (gate * valid) * (sg - cg)   # drops/pads collapse to cg
+        return torch.scatter(c_prev, 2, idx_d, sg)
 
     def forward(self, x_tok, c_prev):
         return self.step(self.prep(x_tok), c_prev)
@@ -398,6 +423,14 @@ class MachineStrokes(nn.Module):
         # pairs absorb the round into persistent state; sleepers stay
         # bit-frozen (readable, never drifting)
         self.sparse_state = getattr(cfg, "fs_sparse_state", False)
+        # fs_capacity > 0: run the routed GEMMs on gathered FCFS capacity
+        # buffers instead of dense-masked (execution change; the math is
+        # identical except position-order drops when a machine's buffer
+        # overfills). Requires a router.
+        self.capacity = getattr(cfg, "fs_capacity", 0.0)
+        if self.capacity:
+            assert self.topk or (self.rounds > 1 and self.loop_topk), \
+                "fs_capacity needs fs_topk (or fs_loop_topk) routing"
 
     def init_channel(self, B, T, device=None, dtype=None):
         """Seed conclusions for the first machine block: s0 at every t."""
@@ -410,6 +443,21 @@ class MachineStrokes(nn.Module):
         """Zero all but the top-k entries of v along its last dim."""
         kth = v.topk(k, dim=-1).values[..., -1:]
         return v * (v >= kth).to(v.dtype)
+
+    @staticmethod
+    def _dispatch_idx(r_gate, cap):
+        """FCFS capacity slots: token t claims a slot on machine k iff
+        fewer than cap EARLIER tokens were routed there (causal,
+        Switch-style position-order dropping; overflow tokens fall back
+        to pass-through, a path the model already trains through).
+        r_gate (B,T,K) -> idx (B,K,cap) claimed token positions (arbitrary
+        distinct positions at unfilled slots) + valid (B,K,cap) bool."""
+        B, T, K = r_gate.shape
+        routed = r_gate > 0
+        qpos = routed.to(torch.float32).cumsum(dim=1) - 1  # queue position
+        key = torch.where(routed, qpos, torch.full_like(qpos, float(T)))
+        val, idx = key.topk(cap, dim=1, largest=False)     # first-come wins
+        return idx.permute(0, 2, 1), (val < T).permute(0, 2, 1)
 
     def _confer(self, s):                                 # strokes 2 + 3
         B, K, T, d = s.shape
@@ -444,19 +492,31 @@ class MachineStrokes(nn.Module):
             # fresh routing decision every round, from the states as they
             # now stand — the router IS the halting gate for rounds >= 2
             k_r = self.topk if r == 0 else (self.loop_topk or self.topk)
-            route = None
+            route = disp = None
             if k_r:
                 r_log = (torch.einsum("btc,kc->btk", x, self.route_x)
                          + torch.einsum("bktd,kd->btk", c, self.route_c)
                          + self.route_b)
                 r_gate = self._topk_mask(torch.sigmoid(r_log), k_r)
-                route = r_gate.permute(0, 2, 1)[..., None]  # (B,K,T,1)
                 with torch.no_grad():
                     f = (r_gate > 0).float().mean(dim=(0, 1))  # traffic
                 p = torch.sigmoid(r_log).mean(dim=(0, 1))      # mass
                 lb.append(K * (f * p).sum())               # Switch-style
-            s = self.backend.step(tok_kv, c)              # stroke 1
-            if route is not None:
+                if self.capacity:
+                    cap = min(T, max(1, math.ceil(
+                        self.capacity * T * k_r / K)))     # static shape
+                    idx, valid = self._dispatch_idx(r_gate, cap)
+                    gate = torch.gather(
+                        r_gate.permute(0, 2, 1), 2, idx)[..., None]
+                    disp = (idx, valid[..., None].to(x.dtype), gate)
+                    # effective route (drops zeroed) for the blends below
+                    route = torch.zeros(
+                        B, K, T, dtype=x.dtype, device=x.device).scatter(
+                        2, idx, gate[..., 0] * disp[1][..., 0])[..., None]
+                else:
+                    route = r_gate.permute(0, 2, 1)[..., None]  # (B,K,T,1)
+            s = self.backend.step(tok_kv, c, disp)        # stroke 1
+            if route is not None and disp is None:
                 s = c + route * (s - c)     # unrouted: state passes through
             cand = self._confer(s)
             if self.sparse_state and route is not None:
