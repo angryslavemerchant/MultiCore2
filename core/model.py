@@ -158,6 +158,18 @@ class GPTConfig:
                                # bill of the population — recompute them
                                # in backward instead of storing (~1 extra
                                # M fwd; buys micro-batch headroom)
+    # Delta machines (core/deltamachines.py, pattern D, 2026-08-13): v3 of
+    # the population — no cross-depth channel, per-machine gated-delta-rule
+    # memory (fixed-size state) instead of intake attention, conference
+    # over the active views, and the anti-collapse routing package.
+    # Shares fs_n_machines/fs_d_machine/fs_n_head_m/fs_mlp_mult/
+    # fs_mlp_depth/fs_topk/fs_conf_sink/fs_addr_mix above.
+    fs_chunk: int = 64         # delta-scan chunk length (also the intra-
+                               # chunk "window" the FLOPs scorer charges)
+    fs_conv: int = 4           # causal depthwise conv (zero-init) on the
+                               # stream feeding machine projections; 0=off
+    fs_route_noise: float = 0.0  # train-time router logit noise std
+    fs_zloss: float = 0.0      # router z-loss coefficient (0 disables)
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
@@ -216,7 +228,8 @@ class GPTConfig:
             f"{self.n_layer_total()} layers")
         key = {"F": self.attn, "S": "swa", "G": "gated", "C": "cow",
                "K": "chunk", "B": "blocksum", "N": "chunkv2",
-               "T": "topkside", "R": "swaside", "M": "fourstroke"}
+               "T": "topkside", "R": "swaside", "M": "fourstroke",
+               "D": "deltamachines"}
         return [key[c] for c in self.attn_pattern]
 
     def layer_windows(self):
@@ -227,7 +240,8 @@ class GPTConfig:
         # the MLP, not the window) — no window entry applies to them.
         # fourstroke (M) layers window their INTAKE via cfg.fs_window,
         # not the token-path window schedule.
-        full = [k == self.attn or k in ("topkside", "fourstroke")
+        full = [k == self.attn
+                or k in ("topkside", "fourstroke", "deltamachines")
                 for k in attns]
         if not self.windows:
             return [None if f else self.window
@@ -465,6 +479,9 @@ def make_block(cfg, attn_key, fs_seed=True):
     if attn_key == "fourstroke":
         from core.fourstroke import FourStrokeBlock
         return FourStrokeBlock(cfg, seed=fs_seed)
+    if attn_key == "deltamachines":
+        from core.deltamachines import DeltaMachineBlock
+        return DeltaMachineBlock(cfg)
     return BLOCKS[cfg.block](cfg, attn_key=attn_key)
 
 
@@ -591,6 +608,14 @@ class GPT(nn.Module):
                   if getattr(b.attn, "lb_loss", None) is not None]
             if lb:
                 loss = loss + self.cfg.lb_coef * torch.stack(lb).mean()
+        # router z-loss (delta machines): keeps route logits small so no
+        # machine's logit can freeze the softmax/sigmoid landscape —
+        # aux-only, val loss stays pure cross-entropy.
+        if self.cfg.fs_zloss > 0 and self.training:
+            z = [b.attn.z_loss for b in self.transformer.h
+                 if getattr(b.attn, "z_loss", None) is not None]
+            if z:
+                loss = loss + self.cfg.fs_zloss * torch.stack(z).mean()
         return logits, loss
 
     # ------------------------------------------------------------- accounting
@@ -647,7 +672,8 @@ class GPT(nn.Module):
         # hourglass layers score at their own (narrower) width; windowed
         # layers at their own (per-layer, cfg.windows) window; looped
         # layers score once per iteration
-        score = sum(lp * 12 * w * (0.0 if k == "fourstroke"
+        score = sum(lp * 12 * w * (0.0 if k in ("fourstroke",
+                                                "deltamachines")
                                    else nsa_keys if k == "nsa"
                                    else T if win is None
                                    else cow_keys if k == "cow"
@@ -662,6 +688,12 @@ class GPT(nn.Module):
         if n_fs:
             from core.fourstroke import fourstroke_score_flops
             score += n_fs * fourstroke_score_flops(self.cfg, T)
+        # delta-machine (D) layers likewise: scan + active conference,
+        # minus the private params unrouted pairs skip
+        n_dm = sum(k == "deltamachines" for k in self.cfg.layer_attns())
+        if n_dm:
+            from core.deltamachines import deltamachines_score_flops
+            score += n_dm * deltamachines_score_flops(self.cfg, T)
         # uberloop: each extra iteration re-spends the layer's matmul
         # FLOPs on weight-tied params that 6*N bills only once
         score += sum(6 * (lp - 1)

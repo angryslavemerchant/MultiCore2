@@ -191,6 +191,21 @@ def parse_args():
     ap.add_argument("--fs-addr-mix", type=float, default=1.0,
                     help="M layers: init of the anchor-vs-state key "
                          "mixing scalar")
+    # Delta machines (pattern D, core/deltamachines.py): v3 population
+    ap.add_argument("--fs-chunk", type=int, default=64,
+                    help="D layers: delta-scan chunk length")
+    ap.add_argument("--fs-conv", type=int, default=4,
+                    help="D layers: causal depthwise conv kernel on the "
+                         "stream feeding machine projections (0 = off)")
+    ap.add_argument("--fs-route-noise", type=float, default=0.0,
+                    help="D layers: train-time router logit noise std "
+                         "(anti-collapse)")
+    ap.add_argument("--fs-zloss", type=float, default=0.0,
+                    help="D layers: router z-loss coefficient")
+    ap.add_argument("--fs-dense-warmup", type=int, default=0,
+                    help="D layers: train the first N steps DENSE (router "
+                         "runs, aux losses on, no top-k mask), then "
+                         "switch to fs-topk (anti-collapse)")
     # Frankenstein stack (all default off; see core/model.py)
     ap.add_argument("--norm", default="ln", choices=("ln", "rms"))
     ap.add_argument("--qk-norm", action="store_true")
@@ -350,6 +365,8 @@ def main():
                              if ("G" in args.attn_pattern
                                  or "C" in args.attn_pattern
                                  or ("M" in args.attn_pattern
+                                     and args.fs_topk)
+                                 or ("D" in args.attn_pattern
                                      and args.fs_topk)) else 0.0),
                     hg_frac=args.hg_frac, hg_bneck=args.hg_bneck,
                     hg_mid=args.hg_mid, hg_round=args.hg_round,
@@ -380,6 +397,11 @@ def main():
                     fs_capacity=args.fs_capacity,
                     fs_grouped=args.fs_grouped,
                     fs_ckpt=args.fs_ckpt,
+                    fs_chunk=args.fs_chunk,
+                    fs_conv=args.fs_conv,
+                    fs_route_noise=args.fs_route_noise,
+                    fs_zloss=(args.fs_zloss
+                              if "D" in args.attn_pattern else 0.0),
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,
@@ -620,7 +642,25 @@ def main():
     # ------------------------------------------------------------ loop
     model.train()
     t_last = time.time()
+    # dense->sparse router warmup (D layers): the first fs_dense_warmup
+    # steps run every machine (topk_now=0 -> no top-k mask; router and
+    # aux losses stay live so the logits keep learning), then flip to
+    # fs_topk. One torch.compile recompile at the flip, resume-safe
+    # (state derives from `step` alone).
+    dm_blocks = []
+    if args.fs_dense_warmup and "D" in args.attn_pattern and args.fs_topk:
+        from core.deltamachines import DeltaMachines
+        dm_blocks = [m for m in raw_model.modules()
+                     if isinstance(m, DeltaMachines)]
     for step in range(start_step, iters):
+        if dm_blocks:
+            k_now = 0 if step < args.fs_dense_warmup else args.fs_topk
+            if dm_blocks[0].topk_now != k_now:
+                for m in dm_blocks:
+                    m.topk_now = k_now
+                print(f"[train] D-layer router: "
+                      f"{'DENSE warmup' if k_now == 0 else f'top-{k_now}'}"
+                      f" at step {step}", flush=True)
         lr = lr_at(step)
         for g in optimizer.param_groups:
             g["lr"] = lr * g.get("lr_scale", 1.0)

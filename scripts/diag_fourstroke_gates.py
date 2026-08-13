@@ -40,6 +40,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.fourstroke import MachineStrokes                     # noqa: E402
+from core.deltamachines import DeltaMachines                   # noqa: E402
 from needle_probe import ensure_corpus                         # noqa: E402
 
 
@@ -151,9 +152,12 @@ def main():
     sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
     model.load_state_dict(sd)
 
-    blocks = [m for m in model.modules() if isinstance(m, MachineStrokes)]
+    # v2 (M, MachineStrokes) and v3 (D, DeltaMachines) share the diag
+    # hook contract, so one autopsy covers both populations
+    blocks = [m for m in model.modules()
+              if isinstance(m, (MachineStrokes, DeltaMachines))]
     if not blocks:
-        json.dump({"skipped": "no MachineStrokes blocks in this arch"},
+        json.dump({"skipped": "no machine-population blocks in this arch"},
                   open(out_path, "w"), indent=2)
         print("[diag_fs] not a fourstroke checkpoint, skipped", flush=True)
         return
