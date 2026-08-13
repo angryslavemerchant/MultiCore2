@@ -30,7 +30,6 @@ import math
 import os
 import sys
 from collections import Counter
-from types import MethodType
 
 import numpy as np
 import torch
@@ -45,50 +44,14 @@ SNIP_BEFORE, SNIP_AFTER = 48, 8
 
 
 class Ctl:
-    """Shared control knobs for all patched blocks."""
+    """Shared mute knobs, read by the REAL forward via the core diag
+    hook (core/fourstroke.py MachineStrokes.diag) — never a
+    reimplemented forward: a v1-era patched forward run on a v2
+    checkpoint measured garbage (baseline 9.76 vs true 3.23,
+    2026-08-13). The hook is equivalence-tested in
+    tests/test_fourstroke.py::test_diag_hooks_are_pure_observers."""
     mute_write = None      # machine index whose gate is forced to 0
     mute_conf = None       # machine index masked out of conference keys
-    collect = False        # gather stats (contexts/lens/graph passes)
-
-
-def patched_forward(self, x, c_prev, ctl, rec):
-    B, T, C = x.shape
-    K, d = self.K, self.d
-    s = self.backend(x, c_prev)
-    sn = self.ln_iface(s)
-    q, ks, v = self.w_qkv(sn).chunk(3, dim=-1)
-    k = (self.anchor[None, :, None, :]
-         + self.addr_mix[None, :, None, None] * ks)
-
-    def heads(t):
-        return (t.permute(0, 2, 1, 3)
-                .reshape(B * T, K, self.H, self.hd).transpose(1, 2))
-
-    scores = heads(q) @ heads(k).transpose(-2, -1) / math.sqrt(self.hd)
-    if ctl.mute_conf is not None:
-        scores[..., ctl.mute_conf] = float("-inf")
-    attn = torch.softmax(scores, dim=-1)          # (B*T, H, K, K)
-    y = attn @ heads(v)
-    y = (y.transpose(1, 2).reshape(B, T, K, d).permute(0, 2, 1, 3))
-    c = s + self.conf_out(y)
-    g = torch.sigmoid(
-        torch.einsum("btc,kc->btk", x, self.gate_x)
-        + torch.einsum("bktd,kd->btk", c, self.gate_c)
-        + self.gate_b)
-    if ctl.mute_write is not None:
-        g = g.clone()
-        g[..., ctl.mute_write] = 0.0
-    out = torch.einsum("btk,bktc->btc", g, self.w_o(c))
-    if ctl.collect:
-        with torch.no_grad():
-            rec["g"] = g.detach().float()                     # (B,T,K)
-            rec["graph"] = (rec.get("graph", 0)
-                            + attn.detach().float().mean(dim=(0, 1)))
-            rec["graph_n"] = rec.get("graph_n", 0) + 1
-            if rec.get("lens_pos") is not None:
-                rec["lens_wo"] = self.w_o(
-                    c[:, :, rec["lens_pos"], :]).detach()     # (B,K,P,C)
-    return out, c
 
 
 def batches(corpus, rng, n_batches, bs, T, device):
@@ -160,10 +123,8 @@ def main():
 
     ctl = Ctl()
     recs = [{} for _ in blocks]
-    for i, b in enumerate(blocks):
-        b.forward = MethodType(
-            (lambda self, x, c, _r=recs[i]:
-             patched_forward(self, x, c, ctl, _r)), b)
+    for b, r in zip(blocks, recs):
+        b.diag = {"ctl": ctl, "rec": r}
 
     from needle_probe import ensure_corpus
     corpus = ensure_corpus()
@@ -173,14 +134,14 @@ def main():
     # loader restores at block 1024) asserts in pass 2 (2026-08-13)
     args.seq_len = T
 
-    # ---- pass 1: collection (contexts, lens, graph) -----------------------
+    # ---- pass 1: collection (contexts, lens, graph, routing) --------------
     print("[interp] pass 1: collection", flush=True)
-    ctl.collect = True
     rng = np.random.default_rng(args.seed)
     lens_rng = np.random.default_rng(args.seed + 1)
     # top gate moments: per (block, machine) running best (val, corpus_pos)
     top = [[([], []) for _ in range(K)] for _ in blocks]
     lens_counts = [[Counter() for _ in range(K)] for _ in blocks]
+    route_acc = [{} for _ in blocks]
     ln_f, lm_head = model.transformer.ln_f, model.lm_head
     with torch.no_grad():
         for starts, x, y in batches(corpus, rng, args.batches,
@@ -192,6 +153,20 @@ def main():
             with amp:
                 model(x)          # logits head skipped (targets=None)
             for li, r in enumerate(recs):
+                rt = r.get("routes") or []
+                if rt:                       # v2 router: per-round stats
+                    ra = route_acc[li]
+                    tr = torch.stack([(g_ > 0).double().mean(dim=(0, 1))
+                                      for g_ in rt])          # (R,K)
+                    ra["traffic"] = ra.get("traffic", 0) + tr.cpu().numpy()
+                    if len(rt) > 1:          # mid-block wake/sleep events
+                        w = ((rt[1] > 0) & (rt[0] == 0)).double()
+                        s_ = ((rt[1] == 0) & (rt[0] > 0)).double()
+                        ra["wake"] = (ra.get("wake", 0)
+                                      + w.mean(dim=(0, 1)).cpu().numpy())
+                        ra["sleep"] = (ra.get("sleep", 0)
+                                       + s_.mean(dim=(0, 1)).cpu().numpy())
+                    ra["n"] = ra.get("n", 0) + 1
                 g = r.pop("g")                                # (B,T,K)
                 for k in range(K):
                     v, idx = g[:, :, k].reshape(-1).topk(args.top_snippets)
@@ -210,8 +185,6 @@ def main():
                 for k in range(K):
                     lens_counts[li][k].update(
                         ids[:, k].reshape(-1).cpu().tolist())
-    ctl.collect = False
-
     # decode snippets
     try:
         from transformers import AutoTokenizer
@@ -237,12 +210,21 @@ def main():
                "frac": round(c / max(1, sum(lens_counts[li][k].values())), 3)}
               for t, c in lens_counts[li][k].most_common(8)]
              for k in range(K)] for li in range(len(blocks))]
-    graph = [(r["graph"] / r["graph_n"]).cpu().tolist() for r in recs]
+    # conference graph: hook accumulates head-resolved probs; average
+    # over heads AND the round/batch count
+    graph = [(r["attn"].mean(dim=(0, 1)) / max(1, r["attn_rounds"]))
+             .cpu().tolist() for r in recs]
+    routing = [{k: (np.asarray(v) / ra["n"]).round(4).tolist()
+                for k, v in ra.items() if k != "n"}
+               for ra in route_acc]
     for r in recs:
         r["lens_pos"] = None
 
     # ---- pass 2: ablation matrix ------------------------------------------
+    # recording off (diag without rec): mutes stay active, no capture cost
     print("[interp] pass 2: ablation", flush=True)
+    for b in blocks:
+        b.diag = {"ctl": ctl}
 
     def fixed_rng():
         return np.random.default_rng(args.seed + 999)
@@ -267,7 +249,7 @@ def main():
               "n_blocks": len(blocks),
               "collect_tokens": args.batches * args.micro_bs * T,
               "ablation": ablation, "conference_graph": graph,
-              "lens": lens, "contexts": contexts}
+              "routing": routing, "lens": lens, "contexts": contexts}
     out = os.path.join(run_dir, "interp_fourstroke.json")
     json.dump(report, open(out, "w", encoding="utf-8"),
               indent=1, ensure_ascii=False)

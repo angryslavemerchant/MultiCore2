@@ -460,6 +460,16 @@ class MachineStrokes(nn.Module):
         if self.grouped:
             assert self.topk or (self.rounds > 1 and self.loop_topk), \
                 "fs_grouped needs fs_topk (or fs_loop_topk) routing"
+        # diagnostics hook: scripts set self.diag = {"ctl": obj, "rec": dict}
+        # and the REAL forward records into rec / applies ctl's mutes —
+        # never a reimplemented forward (the 2026-08-13 lesson: a v1-era
+        # patched forward run on v2 weights measured garbage). ctl attrs:
+        # mute_write (machine idx, gate forced 0), mute_conf (machine idx
+        # masked out of conference keys). rec keys written per forward:
+        # "routes" (list per round of float r_gate (B,T,K)), "g" (final
+        # write gates), "attn"/"attn_rounds" (running sum of conference
+        # probs (B*T,H,K,K) and count), "lens_wo" if rec["lens_pos"] set.
+        self.diag = None
 
     def init_channel(self, B, T, device=None, dtype=None):
         """Seed conclusions for the first machine block: s0 at every t."""
@@ -515,7 +525,7 @@ class MachineStrokes(nn.Module):
         val, idx = key.topk(cap, dim=1, largest=False)     # first-come wins
         return idx.permute(0, 2, 1), (val < T).permute(0, 2, 1)
 
-    def _confer(self, s):                                 # strokes 2 + 3
+    def _confer(self, s, diag=None):                      # strokes 2 + 3
         B, K, T, d = s.shape
         sn = self.ln_iface(s)
         q, ks, v = self.w_qkv(sn).chunk(3, dim=-1)
@@ -526,21 +536,42 @@ class MachineStrokes(nn.Module):
             return (t.permute(0, 2, 1, 3)
                     .reshape(B * T, K, self.H, self.hd).transpose(1, 2))
 
-        if self.conf_sink is None:
+        ctl = diag.get("ctl") if diag else None
+        rec = diag.get("rec") if diag else None
+        mute = getattr(ctl, "mute_conf", None) if ctl is not None else None
+        if self.conf_sink is None and mute is None and rec is None:
             y = F.scaled_dot_product_attention(heads(q), heads(k), heads(v))
         else:
             sc = (heads(q) @ heads(k).transpose(-2, -1)
                   / math.sqrt(self.hd))                   # (B*T, H, K, K)
-            sink = (self.conf_sink[None, :, None, None]
-                    .expand(sc.shape[0], -1, K, 1))
-            a = torch.softmax(torch.cat((sc, sink), dim=-1), dim=-1)
-            y = a[..., :K] @ heads(v)                     # sink value = 0
+            if mute is not None:
+                sc = sc.clone()
+                sc[..., mute] = float("-inf")
+            if self.conf_sink is not None:
+                sink = (self.conf_sink[None, :, None, None]
+                        .expand(sc.shape[0], -1, K, 1))
+                a = torch.softmax(torch.cat((sc, sink), dim=-1), dim=-1)
+                probs = a[..., :K]
+                y = probs @ heads(v)                      # sink value = 0
+            else:
+                probs = torch.softmax(sc, dim=-1)
+                y = probs @ heads(v)
+            if rec is not None:
+                with torch.no_grad():
+                    rec["attn"] = (rec.get("attn", 0)
+                                   + probs.detach().float())
+                    rec["attn_rounds"] = rec.get("attn_rounds", 0) + 1
         y = (y.transpose(1, 2).reshape(B, T, K, d).permute(0, 2, 1, 3))
         return s + self.conf_out(y)
 
     def forward(self, x, c_prev):
         B, T, C = x.shape
         K = self.K
+        diag = self.diag
+        ctl = diag.get("ctl") if diag else None
+        rec = diag.get("rec") if diag else None
+        if rec is not None:
+            rec["routes"] = []
         tok_kv = self.backend.prep(x)                     # once per block
         c = c_prev
         lb = []
@@ -554,6 +585,8 @@ class MachineStrokes(nn.Module):
                          + torch.einsum("bktd,kd->btk", c, self.route_c)
                          + self.route_b)
                 r_gate = self._topk_mask(torch.sigmoid(r_log), k_r)
+                if rec is not None:
+                    rec["routes"].append(r_gate.detach().float())
                 with torch.no_grad():
                     f = (r_gate > 0).float().mean(dim=(0, 1))  # traffic
                 p = torch.sigmoid(r_log).mean(dim=(0, 1))      # mass
@@ -579,7 +612,7 @@ class MachineStrokes(nn.Module):
             s = self.backend.step(tok_kv, c, disp, flat)  # stroke 1
             if route is not None and disp is None and flat is None:
                 s = c + route * (s - c)     # unrouted: state passes through
-            cand = self._confer(s)
+            cand = self._confer(s, diag)
             if self.sparse_state and route is not None:
                 cand = c + route * (cand - c)
             c = cand
@@ -590,7 +623,24 @@ class MachineStrokes(nn.Module):
             + self.gate_b)
         if self.topk:
             g = self._topk_mask(g, self.topk)
+        if (ctl is not None
+                and getattr(ctl, "mute_write", None) is not None):
+            g = g.clone()
+            g[..., ctl.mute_write] = 0.0
         out = torch.einsum("btk,bktc->btc", g, self.w_o(c))
+        if rec is not None:
+            with torch.no_grad():
+                rec["g"] = g.detach().float()
+                oc = self.w_o(c).float()
+                rec["wb_out_norm"] = out.detach().float().norm(dim=-1).sum()
+                rec["wb_x_norm"] = x.detach().float().norm(dim=-1).sum()
+                rec["wo_norm_k"] = (g.float().permute(0, 2, 1)[..., None]
+                                    * oc).norm(dim=-1).sum(dim=(0, 2))
+                rec["c_norm_k"] = c.detach().float().norm(dim=-1).sum(
+                    dim=(0, 2))
+                if rec.get("lens_pos") is not None:
+                    rec["lens_wo"] = self.w_o(
+                        c[:, :, rec["lens_pos"], :]).detach()
         return out, c
 
 

@@ -32,7 +32,6 @@ import json
 import math
 import os
 import sys
-from types import MethodType
 
 import numpy as np
 import torch
@@ -51,50 +50,29 @@ def _acc(rec, key, val):
     rec[key] = rec[key] + v
 
 
-def instrumented_forward(self, x, c_prev, rec):
-    """MachineStrokes.forward with stats taps. Same math as the module
-    (conference y computed from the explicit softmax so the recorded
-    probabilities are exactly the ones used)."""
-    B, T, C = x.shape
-    K, d = self.K, self.d
-    s = self.backend(x, c_prev)                       # stroke 1
-    sn = self.ln_iface(s)
-    q, ks, v = self.w_qkv(sn).chunk(3, dim=-1)        # stroke 2
-    k = (self.anchor[None, :, None, :]
-         + self.addr_mix[None, :, None, None] * ks)
-
-    def heads(t):
-        return (t.permute(0, 2, 1, 3)
-                .reshape(B * T, K, self.H, self.hd).transpose(1, 2))
-
-    qh, kh, vh = heads(q), heads(k), heads(v)
-    attn = torch.softmax(qh @ kh.transpose(-2, -1) / math.sqrt(self.hd),
-                         dim=-1)                      # (B*T, H, K, K)
-    y = attn @ vh
-    y = (y.transpose(1, 2).reshape(B, T, K, d).permute(0, 2, 1, 3))
-    c = s + self.conf_out(y)                          # stroke 3
-    g = torch.sigmoid(                                # stroke 4
-        torch.einsum("btc,kc->btk", x, self.gate_x)
-        + torch.einsum("bktd,kd->btk", c, self.gate_c)
-        + self.gate_b)
-    oc = self.w_o(c)                                  # (B,K,T,C)
-    out = torch.einsum("btk,bktc->btc", g, oc)
-
+def consume(hook, rec, K):
+    """Fold one forward's hook record (core diag hook, REAL forward —
+    see core/fourstroke.py MachineStrokes.diag) into running stats.
+    The hook is equivalence-tested against the unhooked forward; this
+    script never reimplements the math (2026-08-13 lesson)."""
     with torch.no_grad():
+        g = hook.pop("g")                                 # (B,T,K) final
+        B, T, _ = g.shape
         gf = g.float()
         _acc(rec, "n_tok", B * T)
         _acc(rec, "g_sum", gf.sum(dim=(0, 1)))            # (K,)
         _acc(rec, "g_sq", (gf ** 2).sum(dim=(0, 1)))
         _acc(rec, "g_open", (gf > 0.9).double().sum(dim=(0, 1)))
         _acc(rec, "g_shut", (gf < 0.1).double().sum(dim=(0, 1)))
-        # router view: per-token sorted gate mass
+        # router view: per-token sorted gate mass (post any topk mask)
         gs = gf.reshape(-1, K).sort(dim=-1, descending=True).values
         tot = gs.sum(-1).clamp_min(1e-8)
         for kk in (1, 2, 4):
-            _acc(rec, f"route_top{kk}",
-                 (gs[:, :kk].sum(-1) / tot).sum())
-        # conference stats, averaged over heads: (B*T, K, K)
-        p = attn.float().mean(dim=1)
+            _acc(rec, f"route_top{kk}", (gs[:, :kk].sum(-1) / tot).sum())
+        # conference probs: hook sums over rounds; head-average
+        attn = hook.pop("attn")
+        n_r = max(1, hook.pop("attn_rounds", 1))
+        p = (attn / n_r).float().mean(dim=1)              # (B*T, K, K)
         _acc(rec, "conf_ent",
              (-(p.clamp_min(1e-9).log() * p).sum(-1)).sum(dim=0))  # (K,)
         ps = p.sort(dim=-1, descending=True).values
@@ -103,13 +81,23 @@ def instrumented_forward(self, x, c_prev, rec):
         _acc(rec, "conf_self",
              p.diagonal(dim1=-2, dim2=-1).sum(dim=0))              # (K,)
         # write-back contribution vs the residual it lands on
-        _acc(rec, "out_norm", out.float().norm(dim=-1).sum())
-        _acc(rec, "x_norm", x.float().norm(dim=-1).sum())
-        _acc(rec, "wo_norm",                                       # (K,)
-             (gf.permute(0, 2, 1)[..., None] * oc.float())
-             .norm(dim=-1).sum(dim=(0, 2)))
-        _acc(rec, "c_norm", c.float().norm(dim=-1).sum(dim=(0, 2)))
-    return out, c
+        _acc(rec, "out_norm", hook.pop("wb_out_norm"))
+        _acc(rec, "x_norm", hook.pop("wb_x_norm"))
+        _acc(rec, "wo_norm", hook.pop("wo_norm_k"))                # (K,)
+        _acc(rec, "c_norm", hook.pop("c_norm_k"))
+        # v2 router: per-round traffic + mid-block wake/sleep events
+        routes = hook.pop("routes", [])
+        if routes:
+            tr = np.stack([(r_ > 0).double().mean(dim=(0, 1))
+                           .cpu().numpy() for r_ in routes])       # (R,K)
+            _acc(rec, "route_traffic", tr * (B * T))
+            if len(routes) > 1:
+                w = ((routes[1] > 0) & (routes[0] == 0)).double()
+                s_ = ((routes[1] == 0) & (routes[0] > 0)).double()
+                _acc(rec, "route_wake",
+                     w.mean(dim=(0, 1)).cpu().numpy() * (B * T))
+                _acc(rec, "route_sleep",
+                     s_.mean(dim=(0, 1)).cpu().numpy() * (B * T))
 
 
 def finalize(rec, strokes):
@@ -136,6 +124,11 @@ def finalize(rec, strokes):
         "addr_mix": strokes.addr_mix.detach().float().cpu().tolist(),
         "gate_bias": strokes.gate_b.detach().float().cpu().tolist(),
     }
+    if "route_traffic" in rec:
+        out["route_traffic_per_round"] = (rec["route_traffic"] / n).tolist()
+        if "route_wake" in rec:
+            out["route_wake_frac"] = (rec["route_wake"] / n).tolist()
+            out["route_sleep_frac"] = (rec["route_sleep"] / n).tolist()
     return out
 
 
@@ -167,11 +160,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
 
+    hooks = [{} for _ in blocks]
     recs = [{} for _ in blocks]
-    for i, b in enumerate(blocks):
-        b.forward = MethodType(
-            (lambda self, x, c, _r=recs[i]:
-             instrumented_forward(self, x, c, _r)), b)
+    for b, h in zip(blocks, hooks):
+        b.diag = {"rec": h}
 
     corpus = ensure_corpus()
     T = min(args.seq_len, cfg.block_size)
@@ -185,6 +177,8 @@ def main():
                           for s in starts])
             with amp:
                 model(torch.from_numpy(x).to(device))
+            for h, r, b in zip(hooks, recs, blocks):
+                consume(h, r, b.K)
             print(f"[diag_fs] batch {bi + 1}/{args.batches}", flush=True)
 
     report = {

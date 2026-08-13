@@ -621,6 +621,67 @@ def test_grouped_gradients_flow():
         assert p.grad is not None and p.grad.abs().sum() > 0, name
 
 
+class _DiagCtl:
+    mute_write = None
+    mute_conf = None
+
+
+def test_diag_hooks_are_pure_observers():
+    """The diagnostics hook records THROUGH the real forward: outputs
+    must be bit-identical with the hook on vs off (sink config keeps
+    both runs on the explicit-softmax path). This is the equivalence
+    test whose absence let a v1-era reimplemented forward measure
+    garbage on v2 weights (2026-08-13)."""
+    blk = make_block(71, **V2)
+    torch.manual_seed(72)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y0, c0 = run(blk, x)
+    rec = {}
+    blk.strokes.diag = {"ctl": _DiagCtl(), "rec": rec}
+    y1, c1 = run(blk, x)
+    assert torch.equal(y0, y1) and torch.equal(c0, c1)
+    K = blk.strokes.K
+    assert rec["g"].shape == (B, T, K)
+    assert len(rec["routes"]) == V2["fs_loop_rounds"]
+    assert rec["attn_rounds"] == V2["fs_loop_rounds"]
+    assert rec["attn"].shape[-2:] == (K, K)
+
+
+def test_diag_no_sink_explicit_matches_sdpa():
+    """v1 defaults have no sink, so the hook flips conference from SDPA
+    to explicit softmax — same math, tolerance-tight."""
+    blk = make_block(73)
+    torch.manual_seed(74)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y0, c0 = run(blk, x)
+    blk.strokes.diag = {"ctl": _DiagCtl(), "rec": {}}
+    y1, c1 = run(blk, x)
+    assert (y0 - y1).abs().max().item() < 1e-12
+    assert (c0 - c1).abs().max().item() < 1e-12
+
+
+def test_diag_mutes():
+    """mute_write silences a machine's token writes (out changes, c
+    identical: gates never touch state); mute_conf makes it unreadable
+    (both change)."""
+    blk = make_block(75, **V2)
+    with torch.no_grad():                 # w_o is zero-init: un-zero it
+        blk.strokes.w_o.weight.normal_(0, 0.02)
+    torch.manual_seed(76)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    ctl = _DiagCtl()
+    blk.strokes.diag = {"ctl": ctl, "rec": {}}
+    y0, c0 = run(blk, x)
+    ctl.mute_write = 1
+    y1, c1 = run(blk, x)
+    assert not torch.equal(y0, y1)
+    assert torch.equal(c0, c1)
+    ctl.mute_write, ctl.mute_conf = None, 1
+    y2, c2 = run(blk, x)
+    assert not torch.equal(y0, y2)
+    assert not torch.equal(c0, c2)
+
+
 @needs_triton
 def test_grouped_autocast_mixed_dtypes():
     """The trainer's real setup: fp32 master params + autocast
