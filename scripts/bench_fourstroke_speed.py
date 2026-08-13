@@ -33,14 +33,15 @@ def mimo_cfg():
                      attn_pattern="SSSFSSSFSSSF", **SPEEDRUN)
 
 
-def fourstroke_cfg():
+def fourstroke_cfg(capacity=0.0):
     return GPTConfig(n_layer=12, n_head=8, n_embd=512,
                      attn_pattern="MMMFMMMFMMMF",
                      fs_n_machines=16, fs_d_machine=256, fs_n_head_m=4,
                      fs_backend="swa", fs_window=128,
                      fs_topk=4, fs_loop_rounds=2, fs_loop_topk=4,
                      fs_conf_sink=True, fs_tkv_heads=16, fs_mlp_depth=1,
-                     fs_sparse_state=True, **SPEEDRUN)
+                     fs_sparse_state=True, fs_capacity=capacity,
+                     **SPEEDRUN)
 
 
 def bench(name, cfg, batch, steps, compile_model=True):
@@ -79,24 +80,31 @@ def bench(name, cfg, batch, steps, compile_model=True):
     return toks
 
 
-def check_compiled_numerics():
+def check_compiled_numerics(capacity=0.0):
     """Compiled vs eager logits for the M block at fp32 (the flex mask
     gotcha: compiled masks can silently corrupt; verify before trusting
-    any compiled timing or run)."""
+    any compiled timing or run). capacity > 0 additionally exercises the
+    sparse-dispatch gather/scatter path under the compiler."""
     torch.manual_seed(1)
     cfg = GPTConfig(block_size=512, vocab_size=1024, n_layer=4, n_head=8,
                     n_embd=512, attn_pattern="MMMF", pos="rope",
                     norm="rms", qk_norm=True, untied=True, zero_init=True,
                     bias=False, mlp="relu2", window=128,
                     fs_n_machines=16, fs_d_machine=128, fs_n_head_m=2,
-                    fs_backend="swa", fs_window=128)
+                    fs_backend="swa", fs_window=128,
+                    fs_topk=4 if capacity else 0,
+                    fs_loop_rounds=2 if capacity else 1,
+                    fs_loop_topk=4 if capacity else 0,
+                    fs_conf_sink=bool(capacity),
+                    fs_sparse_state=bool(capacity), fs_capacity=capacity)
     model = GPT(cfg).cuda().float()
     idx = torch.randint(0, 1024, (2, 512), device="cuda")
     with torch.no_grad():
         eager, _ = model(idx, idx)
         compiled, _ = torch.compile(model)(idx, idx)
     err = (eager - compiled).abs().max().item()
-    print(f"compiled-vs-eager max |dlogit| = {err:.2e}", flush=True)
+    tag = f"capacity={capacity}" if capacity else "dense-masked"
+    print(f"compiled-vs-eager ({tag}) max |dlogit| = {err:.2e}", flush=True)
     assert err < 1e-3, "compiled M-block diverges from eager -- DO NOT TRAIN"
     print("NUMERICS_OK", flush=True)
 
@@ -110,19 +118,25 @@ def main():
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--check", action="store_true",
                     help="compiled-vs-eager numerics only")
+    ap.add_argument("--fs-capacity", type=float, default=1.25,
+                    help="capacity factor for the dispatch arm")
     args = ap.parse_args()
     print(torch.cuda.get_device_name(0), flush=True)
     if args.check:
         check_compiled_numerics()
+        check_compiled_numerics(args.fs_capacity)
         return
     if args.arch in ("fourstroke", "both"):
         check_compiled_numerics()
+        check_compiled_numerics(args.fs_capacity)
     if args.arch in ("mimo", "both"):
         bench("mimo", mimo_cfg(), args.batch, args.steps,
               not args.no_compile)
     if args.arch in ("fourstroke", "both"):
-        bench("fourstroke", fourstroke_cfg(), args.batch, args.steps,
+        bench("fs-dense", fourstroke_cfg(), args.batch, args.steps,
               not args.no_compile)
+        bench("fs-disp", fourstroke_cfg(args.fs_capacity), args.batch,
+              args.steps, not args.no_compile)
 
 
 if __name__ == "__main__":
