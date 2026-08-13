@@ -85,7 +85,10 @@ def test_forward_matches_reference(lens, d_in, d_out, dtype):
     tg, tr = build_tile_map(offs, 64, n // 64 + len(lens))
     y = grouped_mm(x, w, offs, tg, tr)
     ref = grouped_mm_reference(x.double(), w.double(), offs).to(dtype)
-    tol = 1e-2 if dtype == torch.float16 else 1e-4
+    # fp32 tl.dot runs as TF32 on sm80+ (10-bit mantissa; the sm75 2060
+    # has no TF32 units and computes true fp32) — bound must cover both.
+    # Real training runs bf16/fp16 via autocast; fp32 is a test-only path.
+    tol = 1e-2 if dtype == torch.float16 else 2e-3
     assert (y - ref).abs().max().item() < tol * max(1.0, ref.abs().max().item())
 
 
@@ -104,8 +107,10 @@ def test_backward_matches_reference():
     x2 = x.detach().double().requires_grad_()
     w2 = w.detach().double().requires_grad_()
     grouped_mm_reference(x2, w2, offs).backward(g.double())
-    assert (x.grad - x2.grad.float()).abs().max().item() < 1e-3
-    assert (w.grad - w2.grad.float()).abs().max().item() < 1e-3
+    # 5e-3: fp32 dots run as TF32 on sm80+ (see forward test); observed
+    # 1.9e-3 max on a 5090 (torch 2.12 / triton 3.7), true-fp32 sm75 ~1e-4
+    assert (x.grad - x2.grad.float()).abs().max().item() < 5e-3
+    assert (w.grad - w2.grad.float()).abs().max().item() < 5e-3
 
 
 @needs_gpu
