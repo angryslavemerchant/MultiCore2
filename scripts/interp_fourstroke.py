@@ -168,6 +168,10 @@ def main():
     from needle_probe import ensure_corpus
     corpus = ensure_corpus()
     T = min(args.seq_len, cfg.block_size)
+    # eval_loss and every later batches() call read args.seq_len — clamp
+    # it too, or a checkpoint reloaded at a smaller block (the v2 bench
+    # loader restores at block 1024) asserts in pass 2 (2026-08-13)
+    args.seq_len = T
 
     # ---- pass 1: collection (contexts, lens, graph) -----------------------
     print("[interp] pass 1: collection", flush=True)
