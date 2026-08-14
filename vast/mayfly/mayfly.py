@@ -65,6 +65,38 @@ def bail(code, event, tail=""):
     sys.exit(code)
 
 
+def run_wait_up(a):
+    """WAIT-UP MODE: the inverse watch — ssh failure is EXPECTED, first
+    success is the event. For box provisioning, reboots, key
+    propagation. Exits 0 (DONE) when --ready-cmd first succeeds over
+    ssh, 6 (DEADLINE) at the bound. A bare `until ssh; do sleep; done`
+    loop is this mode done wrong: no deadline, no heartbeat, no loud
+    exit — an agent behind one is indistinguishable from a dead one
+    (observed live 2026-08-14; a human had to poke)."""
+    t0 = time.time()
+    dl = a.deadline_min or 15          # provisioning must be bounded
+    tries = 0
+    while True:
+        tries += 1
+        try:
+            r = subprocess.run(a.ssh.split() + [a.ready_cmd],
+                               capture_output=True, text=True,
+                               timeout=a.ssh_timeout,
+                               encoding="utf-8", errors="replace")
+            if r.returncode == 0:
+                heartbeat(a, "TERMINAL DONE", f"up after {tries} tries")
+                bail(0, f"DONE box is up ({tries} tries, "
+                        f"{(time.time() - t0) / 60:.1f} min)")
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        heartbeat(a, "WAITING", f"try {tries}")
+        if (time.time() - t0) / 60 > dl:
+            bail(6, f"DEADLINE box not up after {dl} min "
+                    f"({tries} tries) — check provider status / "
+                    "destroy and re-rent")
+        time.sleep(a.interval)
+
+
 def run_deadman(a):
     """Watch a heartbeat FILE. Exits 7 when it goes stale, 0 if the
     watched mayfly wrote a terminal status, 6 at deadline."""
@@ -177,11 +209,23 @@ def main():
                         "instead of a remote log")
     p.add_argument("--stale-min", type=float, default=6,
                    help="deadman: minutes without heartbeat = dead")
+    p.add_argument("--wait-up", action="store_true",
+                   help="WAIT-UP MODE: exit 0 when ssh first succeeds "
+                        "(box provisioning); deadline-bounded (15 min "
+                        "default)")
+    p.add_argument("--ready-cmd", default="true",
+                   help="wait-up: remote command that must succeed to "
+                        "count as up")
     a = p.parse_args()
     if a.deadman:
         run_deadman(a)
+    if a.wait_up:
+        if not a.ssh:
+            say("wait-up needs --ssh")
+            sys.exit(2)
+        run_wait_up(a)
     if not a.ssh or not a.log:
-        say("need --ssh and --log (or --deadman)")
+        say("need --ssh and --log (or --deadman / --wait-up)")
         sys.exit(2)
     run_watch(a)
 

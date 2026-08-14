@@ -50,6 +50,24 @@ python vast/mayfly/mayfly.py --deadman /path/to/local/mayfly.hb \
 On every exit the log tail (~4 KB) plus a final `EVENT:<NAME>` line is
 on stdout, so the woken agent has context with zero extra round-trips.
 
+## The prime rule: every wait is a watch
+
+If you are about to write ANY wait loop — for a log, a box, an ssh
+port, a file, a process — launch a mayfly instead. A bare
+`until <check>; do sleep; done` background loop is a mayfly with every
+safety feature deleted: no deadline, no heartbeat, no loud exit, no
+context on wake. An agent sitting behind one is indistinguishable from
+a dead agent, and a human ends up poking it ("is it stuck?") — which is
+the exact failure this kit exists to abolish (observed live
+2026-08-14, twice: box-provisioning waits done as bare loops while a
+mayfly watched only the training log).
+
+Waiting for a box to come up is `--wait-up` (ssh success IS the event,
+15-min default deadline). Waiting for a run is the normal watch mode.
+Waiting for anything else: normal watch mode pointed at whatever file
+or command exposes the state, with `--deadline-min` set. There is no
+legitimate unbounded silent wait.
+
 ## Rules for the agent that launches it
 
 1. **Write the playbook before sleeping.** For each exit code, one
