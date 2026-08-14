@@ -598,3 +598,24 @@ def test_v31_flops_scorer_prices_mechanisms():
 def test_v31_packed_refuses():
     with pytest.raises(AssertionError):
         DeltaMachines(cfg(fs_packed=True, fs_pop_read=True))
+
+
+@pytest.mark.parametrize("kw", V31)
+def test_v31_warmup_all_params_reach_graph(kw):
+    """The DDP proxy the 2-rank smoke failed (2026-08-14): during DENSE
+    WARMUP (topk_now=0) the v3.1 mechanisms are gated off, but their
+    params must still produce gradients or DDP errors on step 1."""
+    torch.manual_seed(49)
+    model = GPT(cfg(vocab_size=64, n_layer=2, attn_pattern="FD",
+                    fs_zloss=1e-3, lb_coef=0.01, **kw)).double()
+    for blk in model.transformer.h:
+        if hasattr(blk, "machines"):
+            blk.machines.topk_now = 0            # dense warmup mode
+            with torch.no_grad():
+                blk.machines.w_o.weight.normal_(0, 0.02)
+    idx = torch.randint(0, 64, (2, T))
+    tgt = torch.randint(0, 64, (2, T))
+    _, loss = model(idx, tgt)
+    loss.backward()
+    missing = [n for n, p in model.named_parameters() if p.grad is None]
+    assert not missing, missing

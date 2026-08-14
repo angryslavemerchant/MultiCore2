@@ -540,6 +540,21 @@ class DeltaMachines(nn.Module):
             la = la * (rk > 0).to(la.dtype)
         # v3.1 mechanisms activate only under live sparse routing
         # (k_now > 0): during dense warmup every view is private anyway.
+        # Their params must still touch the graph during warmup or DDP
+        # errors on unused parameters (the v2 orphaned-s0 lesson; bit a
+        # 2-rank smoke 2026-08-14) — zero-coefficient anchor below.
+        z31 = None
+        if not k_now and (self.pop_read or self.brief or self.conf_commit):
+            ps = []
+            if self.pop_read:
+                ps.append(self.w_popq.weight.sum())
+            if self.brief:
+                ps += [self.brief_p.sum(), self.anchor_b.sum(),
+                       *(p.sum() for p in self.ln_brief.parameters())]
+            if self.conf_commit:
+                ps += [self.w_commit.weight.sum(), self.commit_b.sum(),
+                       *(p.sum() for p in self.ln_commit.parameters())]
+            z31 = torch.stack(ps).sum() * 0.0
         pop_q = None
         if self.pop_read and k_now:
             qp = self.w_popq(xi).view(B, T, self.H, self.hd).transpose(
@@ -563,7 +578,7 @@ class DeltaMachines(nn.Module):
                                         L=self.chunk)
         out, _ = self._emit(x, o, o_pop, briefs, mask, r_gate, k_now,
                             diag)
-        return out
+        return out if z31 is None else out + z31
 
     def _briefings(self, S0, B, T):
         """Chunk-start states -> per-machine briefing views (B,K,T,d):
