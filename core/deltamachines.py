@@ -487,8 +487,14 @@ class DeltaMachines(nn.Module):
         v = pr[:, 2 * d:3 * d].view(n, H, hd)
         beta = torch.sigmoid(pr[:, 3 * d:3 * d + H]) * rv[:, None]
         la = -(LA_TOTAL / self.chunk) * torch.sigmoid(pr[:, 3 * d + H:])
+        # row-chunk L is a compute blocking factor, NOT the decay-clamp
+        # window (that is fs_chunk, already baked into la above): larger
+        # L = fewer python-level chunk iterations (the packed scan is
+        # launch-bound in eager). Overflow bound: worst in-chunk 1/A is
+        # e^(LA_TOTAL/fs_chunk * L) = e^32 at 256/64 — fp32-safe.
         o, _ = delta_scan_packed(k=k, q=q, v=v, beta=beta, la=la,
-                                 seg=seg, n_seg=K * B, L=self.chunk)
+                                 seg=seg, n_seg=K * B,
+                                 L=min(4 * self.chunk, 256))
         s = gmm(self.ln_o(o.reshape(n, d)), self.w_out.weight,
                 offs, tg, tr)
         if self.use_mlp:
