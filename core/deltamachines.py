@@ -126,6 +126,7 @@ def _scan_chunk_inner(q, k, v, beta, la, s0, L):
     return torch.cat(outs, dim=2).to(q.dtype), S
 
 
+@torch._dynamo.disable
 def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64):
     """Packed gated-delta scan over MACHINE-MAJOR flat rows (the sparse
     fast path: only routed (token, machine) pairs exist as rows).
@@ -147,7 +148,12 @@ def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64):
     The inner scan is activation-checkpointed under grad: its per-row
     state gathers save O(n * H * hd^2) per chunk-tensor for backward
     (~GBs per layer at real shapes — OOMed a 32 GB 5090), while the scan
-    itself is FLOPs-light, so recompute is the right trade."""
+    itself is FLOPs-light, so recompute is the right trade.
+
+    Kept OUT of torch.compile (@dynamo.disable): the row-chunk loop is
+    n/L iterations (~512 at real shapes) and dynamo unrolls it into an
+    hour-scale compile (observed hang on a 5090); the surrounding
+    grouped GEMMs and conference still compile around the break."""
     with torch.autocast(q.device.type, enabled=False):
         if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad
                                         or v.requires_grad):
