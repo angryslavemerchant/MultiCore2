@@ -71,6 +71,12 @@ on stdout, so the woken agent has context with zero extra round-trips.
    provider gives a fresh host key each rental, add
    `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`
    (already fine on vast).
+7. **Git-Bash on Windows mangles the remote path** (MSYS rewrites
+   `/workspace/x.log` to `C:/Program Files/Git/workspace/x.log` before
+   Python sees it — observed live 2026-08-14). Prefix the launch with
+   `MSYS_NO_PATHCONV=1` or run from PowerShell/cmd. mayfly can't detect
+   this itself; the symptom is instant UNREACHABLE with
+   `tail: cannot open 'C:/Program'` in the fail lines.
 
 ## Reusing outside this repo
 

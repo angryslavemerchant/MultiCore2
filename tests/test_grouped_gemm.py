@@ -107,10 +107,17 @@ def test_backward_matches_reference():
     x2 = x.detach().double().requires_grad_()
     w2 = w.detach().double().requires_grad_()
     grouped_mm_reference(x2, w2, offs).backward(g.double())
-    # 5e-3: fp32 dots run as TF32 on sm80+ (see forward test); observed
-    # 1.9e-3 max on a 5090 (torch 2.12 / triton 3.7), true-fp32 sm75 ~1e-4
-    assert (x.grad - x2.grad.float()).abs().max().item() < 5e-3
-    assert (w.grad - w2.grad.float()).abs().max().item() < 5e-3
+    # RELATIVE bounds: fp32 dots run as TF32 on sm80+ (~1e-3 rel), and
+    # accumulation order varies per host/tile schedule — an absolute
+    # bound broke on a second 5090 (dw abs 0.040 on entries of mag ~40,
+    # i.e. exactly TF32-rel; the same stack passed at 1.9e-3 abs on
+    # another host). True-fp32 sm75 lands ~1e-5 rel.
+    dx = (x.grad - x2.grad.float()).abs().max() \
+        / x2.grad.float().abs().max()
+    dw = (w.grad - w2.grad.float()).abs().max() \
+        / w2.grad.float().abs().max()
+    assert dx.item() < 2e-3, f"dx rel {dx:.2e}"
+    assert dw.item() < 2e-3, f"dw rel {dw:.2e}"
 
 
 @needs_gpu
