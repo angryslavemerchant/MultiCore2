@@ -178,6 +178,9 @@ class GPTConfig:
     fs_packed: bool = False    # sparse execution: grouped GEMMs + packed
                                # scan over routed rows only (needs
                                # fs_topk; equivalence-tested vs dense)
+    fs_scan: str = "auto"      # packed-scan impl: "fla" (fused varlen
+                               # kernel, CUDA) | "torch" (exact oracle,
+                               # CPU-capable) | "auto" = fla if available
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)

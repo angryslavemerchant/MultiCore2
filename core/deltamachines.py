@@ -68,6 +68,23 @@ from core.fourstroke import MachineLinear, TokenLinear, MachineMLP
 # -LA_TOTAL / chunk, so 1/A_t <= e^LA_TOTAL ~ 3e3 stays comfortably fp32.
 LA_TOTAL = 8.0
 
+# flash-linear-attention's fused varlen kernel is the fast path for the
+# packed scan (the pure-torch inner is launch-bound: ~5k tok/s on a 5090
+# vs 0.81 ms/layer fwd+bwd for fla at the same shape). Lazy import:
+# False = tried and absent, None = not tried yet.
+_FLA_GDR = None
+
+
+def _fla_kernel():
+    global _FLA_GDR
+    if _FLA_GDR is None:
+        try:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+            _FLA_GDR = chunk_gated_delta_rule
+        except Exception:
+            _FLA_GDR = False
+    return _FLA_GDR
+
 
 def delta_scan_reference(q, k, v, beta, la, s0=None):
     """Sequential oracle. q,k: (N,H,T,dk); v: (N,H,T,dv);
@@ -127,7 +144,7 @@ def _scan_chunk_inner(q, k, v, beta, la, s0, L):
 
 
 @torch._dynamo.disable
-def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64):
+def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64, impl="auto"):
     """Packed gated-delta scan over MACHINE-MAJOR flat rows (the sparse
     fast path: only routed (token, machine) pairs exist as rows).
 
@@ -153,7 +170,16 @@ def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64):
     Kept OUT of torch.compile (@dynamo.disable): the row-chunk loop is
     n/L iterations (~512 at real shapes) and dynamo unrolls it into an
     hour-scale compile (observed hang on a 5090); the surrounding
-    grouped GEMMs and conference still compile around the break."""
+    grouped GEMMs and conference still compile around the break.
+
+    impl: "torch" = the pure-torch inner (exact, CPU-capable, oracle);
+    "fla" = flash-linear-attention's fused varlen kernel (CUDA-only,
+    bf16 I/O with fp32 state — fast path; final state not returned);
+    "auto" = fla when importable and on CUDA, else torch."""
+    use_fla = (impl == "fla" or (impl == "auto" and q.is_cuda
+                                 and _fla_kernel()))
+    if use_fla:
+        return _scan_packed_fla(q, k, v, beta, la, seg, n_seg)
     with torch.autocast(q.device.type, enabled=False):
         if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad
                                         or v.requires_grad):
@@ -162,6 +188,33 @@ def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64):
                     a, b, c, d, e, seg, n_seg, L),
                 q, k, v, beta, la, use_reentrant=False)
         return _scan_packed_inner(q, k, v, beta, la, seg, n_seg, L)
+
+
+def _scan_packed_fla(q, k, v, beta, la, seg, n_seg):
+    """fla fast path. Same row contract as _scan_packed_inner; segments
+    become varlen sequences via cu_seqlens (empty segments simply have
+    no rows — a zero-length "sequence" never materializes, matching the
+    hold-is-identity semantics). Recurrence convention verified against
+    delta_scan_reference in tests (decay-then-delta; scalar decay
+    commutes with the delta projector, so order is not a distinction).
+    q,k,v,beta go bf16 (kernel accumulates state in fp32), g = log decay
+    stays fp32, scale=1.0 (our q is L2-normalized, o = S^T q unscaled).
+    Final state is not returned (None): the packed forward discards it,
+    and skipping output_final_state avoids the (n_seg,H,dk,dv) write."""
+    fn = _fla_kernel()
+    assert fn, "flash-linear-attention not installed (impl='fla')"
+    n = q.shape[0]
+    bounds = torch.nonzero(seg[1:] != seg[:-1], as_tuple=True)[0] + 1
+    cu = torch.cat([bounds.new_zeros(1), bounds,
+                    bounds.new_full((1,), n)]).to(torch.int32)
+    with torch.autocast(q.device.type, enabled=False):
+        o, _ = fn(q.unsqueeze(0).to(torch.bfloat16),
+                  k.unsqueeze(0).to(torch.bfloat16),
+                  v.unsqueeze(0).to(torch.bfloat16),
+                  g=la.unsqueeze(0).to(torch.float32),
+                  beta=beta.unsqueeze(0).to(torch.bfloat16),
+                  scale=1.0, output_final_state=False, cu_seqlens=cu)
+    return o.squeeze(0).to(q.dtype), None
 
 
 def _scan_packed_inner(q, k, v, beta, la, seg, n_seg, L):
@@ -286,6 +339,7 @@ class DeltaMachines(nn.Module):
         # tested); requires a router; dense warmup and diag hooks fall
         # back to the dense path.
         self.packed = getattr(cfg, "fs_packed", False)
+        self.scan_impl = getattr(cfg, "fs_scan", "auto")
         if self.packed:
             assert self.topk, "fs_packed needs fs_topk routing"
         self.lb_loss = None
@@ -494,7 +548,8 @@ class DeltaMachines(nn.Module):
         # e^(LA_TOTAL/fs_chunk * L) = e^32 at 256/64 — fp32-safe.
         o, _ = delta_scan_packed(k=k, q=q, v=v, beta=beta, la=la,
                                  seg=seg, n_seg=K * B,
-                                 L=min(4 * self.chunk, 256))
+                                 L=min(4 * self.chunk, 256),
+                                 impl=self.scan_impl)
         s = gmm(self.ln_o(o.reshape(n, d)), self.w_out.weight,
                 offs, tg, tr)
         if self.use_mlp:

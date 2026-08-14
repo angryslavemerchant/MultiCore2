@@ -216,6 +216,10 @@ def parse_args():
     ap.add_argument("--fs-packed", action="store_true",
                     help="D layers: sparse execution (grouped GEMMs + "
                          "packed scan over routed rows only)")
+    ap.add_argument("--fs-scan", default="auto",
+                    choices=("auto", "fla", "torch"),
+                    help="packed-scan impl: fla fused varlen kernel vs "
+                         "exact pure-torch; auto = fla if installed")
     # Frankenstein stack (all default off; see core/model.py)
     ap.add_argument("--norm", default="ln", choices=("ln", "rms"))
     ap.add_argument("--qk-norm", action="store_true")
@@ -416,6 +420,7 @@ def main():
                     fs_dm_conf=not args.fs_dm_no_conf,
                     fs_dm_gate=not args.fs_dm_no_gate,
                     fs_packed=args.fs_packed,
+                    fs_scan=args.fs_scan,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

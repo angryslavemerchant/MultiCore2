@@ -332,3 +332,126 @@ def test_flops_scorer_prices_sparsity():
     assert deltamachines_score_flops(one, T) \
         < deltamachines_score_flops(sparse, T) \
         < deltamachines_score_flops(dense, T)
+
+
+# ---------------------------------------------------------------- fla path
+# The fused varlen kernel (flash-linear-attention) is the packed scan's
+# fast path. These tests are the convention gate the integration crib
+# demands: fla's recurrence must match OUR reference (decay-then-delta;
+# scalar decay commutes with the projector, so any ordering difference
+# would surface here), scale must be 1.0, segments must map onto
+# cu_seqlens including empties. bf16 kernel vs fp64 oracle => loose
+# tolerances chosen from bf16 mantissa (~3 decimal digits) with scan
+# accumulation; the TORCH path keeps the exact 1e-10 tests above.
+
+def _fla_ready():
+    from core.deltamachines import _fla_kernel
+    return torch.cuda.is_available() and bool(_fla_kernel())
+
+
+requires_fla = pytest.mark.skipif(
+    not _fla_ready(), reason="needs CUDA + flash-linear-attention")
+
+
+def _packed_inputs_cuda(lens, H=2, hd=64, seed=7):
+    torch.manual_seed(seed)
+    n = sum(lens)
+    dev = "cuda"
+    seg = torch.cat([torch.full((ln,), i, dtype=torch.int64)
+                     for i, ln in enumerate(lens)]).to(dev)
+    q = torch.nn.functional.normalize(
+        torch.randn(n, H, hd, device=dev), dim=-1)
+    k = torch.nn.functional.normalize(
+        torch.randn(n, H, hd, device=dev), dim=-1)
+    v = torch.randn(n, H, hd, device=dev)
+    beta = torch.rand(n, H, device=dev) * 0.9
+    la = -torch.rand(n, H, device=dev) * 0.125
+    return q, k, v, beta, la, seg
+
+
+@requires_fla
+def test_fla_matches_per_segment_oracle():
+    """fla varlen kernel == sequential fp64 oracle per segment (ragged
+    lengths crossing fla's internal chunk size, empty segments dropped
+    from cu_seqlens). This is the recurrence-convention gate."""
+    from core.deltamachines import _scan_packed_fla
+    lens = [37, 0, 130, 64, 1, 0, 200, 23]
+    q, k, v, beta, la, seg = _packed_inputs_cuda(lens)
+    o, _ = _scan_packed_fla(q, k, v, beta, la, seg, len(lens))
+    off = 0
+    for i, ln in enumerate(lens):
+        if ln == 0:
+            continue
+        sl = slice(off, off + ln)
+        o_ref, _ = delta_scan_reference(
+            q[sl].double().transpose(0, 1)[None].cpu(),
+            k[sl].double().transpose(0, 1)[None].cpu(),
+            v[sl].double().transpose(0, 1)[None].cpu(),
+            beta[sl].double().t()[None].cpu(),
+            la[sl].double().t()[None].cpu())
+        got = o[sl].float().transpose(0, 1).cpu()
+        ref = o_ref[0].float()
+        rel = (got - ref).norm() / ref.norm()
+        assert rel < 2e-2, f"seg {i} rel {rel:.3e} (convention mismatch?)"
+        off += ln
+
+
+@requires_fla
+def test_fla_matches_torch_packed():
+    """Same inputs through the fla path and the exact torch path: close
+    (bf16 vs fp32 state), and both differentiable with agreeing grads."""
+    from core.deltamachines import _scan_packed_fla, _scan_packed_inner
+    lens = [64, 96, 0, 33, 127]
+    q, k, v, beta, la, seg = _packed_inputs_cuda(lens, seed=8)
+    leafs = []
+    for t in (q, k, v, beta, la):
+        t = t.clone().requires_grad_(True)
+        leafs.append(t)
+    q1, k1, v1, b1, l1 = leafs
+    o_fla, _ = _scan_packed_fla(q1, k1, v1, b1, l1, seg, len(lens))
+    o_fla.square().sum().backward()
+    g_fla = [t.grad.clone() for t in leafs]
+    for t in leafs:
+        t.grad = None
+    o_t, _ = _scan_packed_inner(q1, k1, v1, b1, l1, seg, len(lens), L=64)
+    o_t.square().sum().backward()
+    g_t = [t.grad.clone() for t in leafs]
+    rel = (o_fla.float() - o_t.float()).norm() / o_t.float().norm()
+    assert rel < 2e-2, f"output rel {rel:.3e}"
+    for name, a, b in zip("qkv beta la".split(), g_fla, g_t):
+        assert torch.isfinite(a).all(), name
+        cos = torch.nn.functional.cosine_similarity(
+            a.flatten(), b.flatten(), dim=0)
+        assert cos > 0.99, f"grad {name} cos {cos:.4f}"
+
+
+@requires_fla
+def test_fla_gpt_train_step_matches_torch():
+    """Full packed GPT train step, fs_scan fla vs torch: finite loss +
+    grads, losses close. The end-to-end integration gate."""
+    losses = {}
+    for impl in ("torch", "fla"):
+        torch.manual_seed(31)
+        # hd=64: fla kernels want real head dims (BASE's hd=8 is
+        # oracle-test-sized, below the kernel's supported range)
+        c = cfg(vocab_size=128, n_layer=2, attn_pattern="FD",
+                fs_d_machine=128, fs_n_head_m=2,
+                fs_packed=True, fs_scan=impl, fs_zloss=1e-3,
+                lb_coef=0.01)
+        model = GPT(c).cuda()
+        with torch.no_grad():
+            for blk in model.transformer.h:
+                if hasattr(blk, "machines"):
+                    blk.machines.w_o.weight.normal_(0, 0.02)
+        model.train()
+        torch.manual_seed(32)
+        idx = torch.randint(0, 128, (2, T), device="cuda")
+        tgt = torch.randint(0, 128, (2, T), device="cuda")
+        _, loss = model(idx, tgt)
+        loss.backward()
+        assert torch.isfinite(loss), impl
+        for n_, p in model.named_parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all(), f"{impl} {n_}"
+        losses[impl] = loss.item()
+    assert abs(losses["fla"] - losses["torch"]) < 2e-2, losses
