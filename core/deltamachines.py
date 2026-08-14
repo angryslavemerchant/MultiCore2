@@ -142,8 +142,19 @@ def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64):
     (2) cumulative decays reset at segment starts, and each segment's
     state picks up its own end-of-chunk decay. A segment absent from a
     chunk keeps its state bit-exactly (matching dense-masked hold).
-    Autocast disabled inside (fp32-state guarantee, as delta_scan_chunk)."""
+    Autocast disabled inside (fp32-state guarantee, as delta_scan_chunk).
+
+    The inner scan is activation-checkpointed under grad: its per-row
+    state gathers save O(n * H * hd^2) per chunk-tensor for backward
+    (~GBs per layer at real shapes — OOMed a 32 GB 5090), while the scan
+    itself is FLOPs-light, so recompute is the right trade."""
     with torch.autocast(q.device.type, enabled=False):
+        if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad
+                                        or v.requires_grad):
+            return torch.utils.checkpoint.checkpoint(
+                lambda a, b, c, d, e: _scan_packed_inner(
+                    a, b, c, d, e, seg, n_seg, L),
+                q, k, v, beta, la, use_reentrant=False)
         return _scan_packed_inner(q, k, v, beta, la, seg, n_seg, L)
 
 
