@@ -220,6 +220,18 @@ def parse_args():
                     choices=("auto", "fla", "torch"),
                     help="packed-scan impl: fla fused varlen kernel vs "
                          "exact pure-torch; auto = fla if installed")
+    ap.add_argument("--fs-pop-read", action="store_true",
+                    help="D: shared-query population reads; conference "
+                         "over all K views (v3.1)")
+    ap.add_argument("--fs-brief", action="store_true",
+                    help="D: per-chunk private state briefings join the "
+                         "conference (v3.1)")
+    ap.add_argument("--fs-mag-topk", action="store_true",
+                    help="D: residual writes selected by magnitude "
+                         "(emergent write routing; needs --fs-pop-read)")
+    ap.add_argument("--fs-conf-commit", action="store_true",
+                    help="D: commit conference messages into states at "
+                         "chunk edges (v3.1)")
     # Frankenstein stack (all default off; see core/model.py)
     ap.add_argument("--norm", default="ln", choices=("ln", "rms"))
     ap.add_argument("--qk-norm", action="store_true")
@@ -421,6 +433,10 @@ def main():
                     fs_dm_gate=not args.fs_dm_no_gate,
                     fs_packed=args.fs_packed,
                     fs_scan=args.fs_scan,
+                    fs_pop_read=args.fs_pop_read,
+                    fs_brief=args.fs_brief,
+                    fs_mag_topk=args.fs_mag_topk,
+                    fs_conf_commit=args.fs_conf_commit,
                     norm=args.norm, qk_norm=args.qk_norm,
                     diff_attn=args.diff_attn, canon=args.canon,
                     canon_full=args.canon_full,

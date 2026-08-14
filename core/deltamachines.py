@@ -104,17 +104,23 @@ def delta_scan_reference(q, k, v, beta, la, s0=None):
     return torch.stack(outs, dim=2), S
 
 
-def delta_scan_chunk(q, k, v, beta, la, s0=None, L=64):
+def delta_scan_chunk(q, k, v, beta, la, s0=None, L=64,
+                     return_starts=False):
     """Chunkwise-parallel gated delta scan (UT transform, module
     docstring). Same contract as the reference; computes in
     promote(input, fp32) and casts the output back. Autocast is
     DISABLED inside: amp would silently downcast the state matmuls to
-    fp16/bf16, breaking the fp32-state guarantee."""
+    fp16/bf16, breaking the fp32-state guarantee.
+
+    return_starts=True additionally returns the state at the START of
+    every chunk, stacked (n_chunks, N, H, dk, dv) — the causally-safe
+    snapshots the briefing mechanism reads (a chunk's tokens may see
+    the state as of the chunk start: strictly past writes only)."""
     with torch.autocast(q.device.type, enabled=False):
-        return _scan_chunk_inner(q, k, v, beta, la, s0, L)
+        return _scan_chunk_inner(q, k, v, beta, la, s0, L, return_starts)
 
 
-def _scan_chunk_inner(q, k, v, beta, la, s0, L):
+def _scan_chunk_inner(q, k, v, beta, la, s0, L, return_starts=False):
     N, H, T, dk = k.shape
     dv = v.shape[-1]
     dt = torch.promote_types(q.dtype, torch.float32)
@@ -124,7 +130,10 @@ def _scan_chunk_inner(q, k, v, beta, la, s0, L):
          if s0 is None else s0.to(dt))
     eye = torch.eye(L, dtype=dt, device=q.device)
     outs = []
+    starts = [] if return_starts else None
     for s_ in range(0, T, L):
+        if starts is not None:
+            starts.append(S)
         e = min(s_ + L, T)
         Lc = e - s_
         Kc, Vc, Qc = k_[:, :, s_:e], v_[:, :, s_:e], q_[:, :, s_:e]
@@ -140,7 +149,10 @@ def _scan_chunk_inner(q, k, v, beta, la, s0, L):
         outs.append(Qt @ S + torch.tril(Qt @ Kc.transpose(-2, -1)) @ W)
         S = (torch.exp(cl[..., -1])[..., None, None]
              * (S + Kc.transpose(-2, -1) @ W))
-    return torch.cat(outs, dim=2).to(q.dtype), S
+    o = torch.cat(outs, dim=2).to(q.dtype)
+    if starts is not None:
+        return o, S, torch.stack(starts, dim=0)
+    return o, S
 
 
 @torch._dynamo.disable
@@ -342,6 +354,47 @@ class DeltaMachines(nn.Module):
         self.scan_impl = getattr(cfg, "fs_scan", "auto")
         if self.packed:
             assert self.topk, "fs_packed needs fs_topk routing"
+        # ---- v3.1 mechanisms (2026-08-14, probe science; dense path
+        # only — no packed impl yet). Each is independent and only
+        # constructs its params when on (DDP orphan rule).
+        # pop_read: ONE shared read-query per token interrogates ALL K
+        #   memories (cheap tier of population reads); unrouted views =
+        #   w_out(readout), NO private MLP (matches the future packed
+        #   cost model); conference widens to all K views.
+        # brief: per-chunk per-machine probe readout of the chunk-START
+        #   state (causal) joins the conference as attend-only views.
+        # mag_topk: residual writes = top-k of post-conference
+        #   |gate * w_o(c)| — emergent write routing; the ROUTER still
+        #   owns state-write routing (beta masking) and its aux losses.
+        # conf_commit: conference messages, averaged per chunk, are
+        #   written into each machine's state at chunk edges (rank-1
+        #   delta-rule write) — the sequential-over-chunks recurrence.
+        self.pop_read = getattr(cfg, "fs_pop_read", False)
+        self.brief = getattr(cfg, "fs_brief", False)
+        self.mag_topk = getattr(cfg, "fs_mag_topk", False)
+        self.conf_commit = getattr(cfg, "fs_conf_commit", False)
+        if self.pop_read:
+            assert self.topk, "fs_pop_read is meaningless without routing"
+            self.w_popq = nn.Linear(C, d, bias=False)
+        if self.brief:
+            assert self.use_conf, "fs_brief needs the conference"
+            self.brief_p = nn.Parameter(torch.randn(K, H, self.hd) * 0.02)
+            self.ln_brief = make_norm(cfg, d)
+            self.anchor_b = nn.Parameter(torch.empty(K, d))
+            nn.init.orthogonal_(self.anchor_b)
+        if self.mag_topk:
+            assert self.pop_read, ("magnitude write selection over all K "
+                                   "needs population reads for unrouted "
+                                   "views")
+        if self.conf_commit:
+            assert self.use_conf, "fs_conf_commit commits conference msgs"
+            self.ln_commit = make_norm(cfg, d)
+            self.w_commit = MachineLinear(K, d, 2 * d)
+            self.commit_b = nn.Parameter(torch.full((K, H), -2.0))
+        if self.packed:
+            assert not (self.pop_read or self.brief or self.mag_topk
+                        or self.conf_commit), \
+                "v3.1 mechanisms are dense-path probe science (no packed)"
         self.lb_loss = None
         self.z_loss = None
         # diagnostics hook, same contract as MachineStrokes.diag (hooks in
@@ -370,18 +423,31 @@ class DeltaMachines(nn.Module):
         B, K, T, d = x.shape
         return x.reshape(B * K, T, self.H, self.hd).transpose(1, 2)
 
-    def _confer(self, s, mask, diag=None):
+    def _confer(self, s, mask, diag=None, extra=None):
         """K x K conference at each token over the ACTIVE machines' views
-        (mask (B,T,K) bool or None = all active). Same bones as v2."""
+        (mask (B,T,K) bool or None = all active). Same bones as v2.
+        extra (B,K,T,d) adds attend-only participants (briefings): they
+        contribute keys/values under their own anchors but never query,
+        are never masked, and receive no update. Returns (c, msg) where
+        msg = conf_out(y), the per-view conference message (what
+        fs_conf_commit accumulates into states)."""
         B, K, T, d = s.shape
         sn = self.ln_iface(s)
         q, ks, v = self.w_qkv(sn).chunk(3, dim=-1)
         k = (self.anchor[None, :, None, :]
              + self.addr_mix[None, :, None, None] * ks)
+        if extra is not None:
+            _, ks2, v2 = self.w_qkv(extra).chunk(3, dim=-1)
+            k2 = (self.anchor_b[None, :, None, :]
+                  + self.addr_mix[None, :, None, None] * ks2)
+            k = torch.cat([k, k2], dim=1)                 # (B,2K,T,d)
+            v = torch.cat([v, v2], dim=1)
+        Kv = k.shape[1]
 
-        def heads(t):     # (B,K,T,d) -> (B*T, H, K, hd)
+        def heads(t):     # (B,Kx,T,d) -> (B*T, H, Kx, hd)
+            Kx = t.shape[1]
             return (t.permute(0, 2, 1, 3)
-                    .reshape(B * T, K, self.H, self.hd).transpose(1, 2))
+                    .reshape(B * T, Kx, self.H, self.hd).transpose(1, 2))
 
         ctl = diag.get("ctl") if diag else None
         rec = diag.get("rec") if diag else None
@@ -391,10 +457,13 @@ class DeltaMachines(nn.Module):
             y = F.scaled_dot_product_attention(heads(q), heads(k), heads(v))
         else:
             sc = (heads(q) @ heads(k).transpose(-2, -1)
-                  / math.sqrt(self.hd))                   # (B*T, H, K, K)
+                  / math.sqrt(self.hd))                  # (B*T, H, K, Kv)
             if mask is not None:
-                sc = sc.masked_fill(
-                    ~mask.reshape(B * T, 1, 1, K), float("-inf"))
+                vis = mask.reshape(B * T, 1, 1, K)
+                if Kv > K:                # briefings are always visible
+                    vis = torch.cat([vis, vis.new_ones(
+                        B * T, 1, 1, Kv - K)], dim=-1)
+                sc = sc.masked_fill(~vis, float("-inf"))
             if mute is not None:
                 sc = sc.clone()
                 sc[..., mute] = float("-inf")
@@ -402,17 +471,18 @@ class DeltaMachines(nn.Module):
                 sink = (self.conf_sink[None, :, None, None]
                         .expand(sc.shape[0], -1, K, 1))
                 a = torch.softmax(torch.cat((sc, sink), dim=-1), dim=-1)
-                probs = a[..., :K]
+                probs = a[..., :Kv]
             else:
                 probs = torch.softmax(sc, dim=-1)
             y = probs @ heads(v)
             if rec is not None:
                 with torch.no_grad():
                     rec["attn"] = (rec.get("attn", 0)
-                                   + probs.detach().float())
+                                   + probs[..., :K].detach().float())
                     rec["attn_rounds"] = rec.get("attn_rounds", 0) + 1
         y = y.transpose(1, 2).reshape(B, T, K, d).permute(0, 2, 1, 3)
-        return s + self.conf_out(y)
+        msg = self.conf_out(y)
+        return s + msg, msg
 
     def forward(self, x):
         B, T, C = x.shape
@@ -468,42 +538,169 @@ class DeltaMachines(nn.Module):
             # scale by the router sigmoid (its gradient path).
             beta = beta * rk.to(beta.dtype)
             la = la * (rk > 0).to(la.dtype)
-        o, _ = delta_scan_chunk(q, k, v, beta, la, L=self.chunk)
+        # v3.1 mechanisms activate only under live sparse routing
+        # (k_now > 0): during dense warmup every view is private anyway.
+        pop_q = None
+        if self.pop_read and k_now:
+            qp = self.w_popq(xi).view(B, T, self.H, self.hd).transpose(
+                1, 2)
+            qp = F.normalize(F.silu(qp), dim=-1)          # (B,H,T,hd)
+            pop_q = (qp[:, None].expand(B, K, self.H, T, self.hd)
+                     .reshape(B * K, self.H, T, self.hd))
+        if self.conf_commit and k_now:
+            return self._forward_commit(x, q, k, v, beta, la, pop_q,
+                                        mask, r_gate, k_now, diag)
+        briefs = None
+        if self.brief and k_now:
+            o, _, S0 = delta_scan_chunk(q, k, v, beta, la, L=self.chunk,
+                                        return_starts=True)
+            briefs = self._briefings(S0, B, T)
+        else:
+            o, _ = delta_scan_chunk(q, k, v, beta, la, L=self.chunk)
+        o_pop = None
+        if pop_q is not None:
+            o_pop, _ = delta_scan_chunk(pop_q, k, v, beta, la,
+                                        L=self.chunk)
+        out, _ = self._emit(x, o, o_pop, briefs, mask, r_gate, k_now,
+                            diag)
+        return out
+
+    def _briefings(self, S0, B, T):
+        """Chunk-start states -> per-machine briefing views (B,K,T,d):
+        each head's probe reads its state matrix; a chunk's tokens all
+        see the briefing authored at the chunk START (strictly causal)."""
+        nc = S0.shape[0]
+        K, H, hd = self.K, self.H, self.hd
+        p = (self.brief_p[None].expand(B, K, H, hd)
+             .reshape(B * K, H, hd))
+        bv = torch.einsum("cnhkv,nhk->cnhv", S0.to(p.dtype), p)
+        bv = bv.reshape(nc, B, K, self.d).permute(1, 2, 0, 3)
+        bv = bv.repeat_interleave(self.chunk, dim=2)[:, :, :T]
+        return self.ln_brief(bv)
+
+    def _emit(self, x, o, o_pop, briefs, mask, r_gate, k_now, diag):
+        """Post-scan pipeline on any token span: private views for
+        routed pairs (w_out + MLP), pop-read views for unrouted (w_out
+        readout only — the cheap tier a packed impl would pay),
+        conference (+attend-only briefings), gate or magnitude-topk
+        write selection, write-back. Returns (out, msg)."""
+        B, T, C = x.shape
+        K, d = self.K, self.d
+        ctl = diag.get("ctl") if diag else None
+        rec = diag.get("rec") if diag else None
         o = (o.view(B, K, self.H, T, self.hd).permute(0, 1, 3, 2, 4)
              .reshape(B, K, T, d))
         s = self.w_out(self.ln_o(o))
         if self.use_mlp:
             s = s + self.mlp(self.ln_mlp(s))
-        c = self._confer(s, mask, diag) if self.use_conf else s
+        conf_mask = mask
+        if o_pop is not None and mask is not None:
+            op = (o_pop.view(B, K, self.H, T, self.hd)
+                  .permute(0, 1, 3, 2, 4).reshape(B, K, T, d))
+            sp = self.w_out(self.ln_o(op))
+            s = torch.where(mask.permute(0, 2, 1)[..., None], s, sp)
+            conf_mask = None                  # all K views confer
+        msg = None
+        if self.use_conf:
+            c, msg = self._confer(s, conf_mask, diag, extra=briefs)
+        else:
+            c = s
         if self.use_gate:
             g = torch.sigmoid(
                 torch.einsum("btc,kc->btk", x, self.gate_x)
                 + torch.einsum("bktd,kd->btk", c, self.gate_c)
                 + self.gate_b)
-            if r_gate is not None:
-                g = g * r_gate
         else:
-            g = (r_gate if r_gate is not None
-                 else x.new_ones(B, T, K))    # MoM-style routed sum
+            g = x.new_ones(B, T, K)
+        wo = self.w_o(c)                                  # (B,K,T,C)
+        if self.mag_topk and k_now:
+            # emergent write routing: top-k of |gate * candidate| —
+            # unrouted machines may win (their views are pop-reads).
+            # r_gate is NOT applied to the output (it still gates state
+            # writes via beta and carries the router's gradient there).
+            mag = g * wo.detach().norm(dim=-1).permute(0, 2, 1)
+            kth = mag.topk(self.topk, dim=-1).values[..., -1:]
+            g = g * (mag >= kth).to(g.dtype)
+        elif r_gate is not None:
+            g = g * r_gate if self.use_gate else r_gate
+        elif not self.use_gate:
+            pass                              # dense ungated: ones
         if (ctl is not None
                 and getattr(ctl, "mute_write", None) is not None):
             g = g.clone()
             g[..., ctl.mute_write] = 0.0
-        out = torch.einsum("btk,bktc->btc", g, self.w_o(c))
+        out = torch.einsum("btk,bktc->btc", g, wo)
         if rec is not None:
             with torch.no_grad():
-                rec["g"] = g.detach().float()
-                oc = self.w_o(c).float()
-                rec["wb_out_norm"] = out.detach().float().norm(dim=-1).sum()
-                rec["wb_x_norm"] = x.detach().float().norm(dim=-1).sum()
-                rec["wo_norm_k"] = (g.float().permute(0, 2, 1)[..., None]
-                                    * oc).norm(dim=-1).sum(dim=(0, 2))
-                rec["c_norm_k"] = c.detach().float().norm(dim=-1).sum(
-                    dim=(0, 2))
-                if rec.get("lens_pos") is not None:
+                rec["g"] = (torch.cat([rec["g"], g.detach().float()],
+                                      dim=1) if rec.get("g") is not None
+                            else g.detach().float())
+                oc = wo.float()
+                rec["wb_out_norm"] = (
+                    rec.get("wb_out_norm", 0)
+                    + out.detach().float().norm(dim=-1).sum())
+                rec["wb_x_norm"] = (
+                    rec.get("wb_x_norm", 0)
+                    + x.detach().float().norm(dim=-1).sum())
+                rec["wo_norm_k"] = (
+                    rec.get("wo_norm_k", 0)
+                    + (g.float().permute(0, 2, 1)[..., None]
+                       * oc).norm(dim=-1).sum(dim=(0, 2)))
+                rec["c_norm_k"] = (
+                    rec.get("c_norm_k", 0)
+                    + c.detach().float().norm(dim=-1).sum(dim=(0, 2)))
+                if (rec.get("lens_pos") is not None
+                        and not self.conf_commit):
                     rec["lens_wo"] = self.w_o(
                         c[:, :, rec["lens_pos"], :]).detach()
-        return out
+        return out, msg
+
+    def _forward_commit(self, x, q, k, v, beta, la, pop_q, mask, r_gate,
+                        k_now, diag):
+        """fs_conf_commit: sequential over chunks — scan a chunk, emit
+        it, average its conference messages per machine, and write them
+        into the states (rank-1 delta-rule write, gentle sigmoid
+        strength) before the next chunk starts. T/chunk tiny sequential
+        steps; everything within a chunk stays parallel."""
+        B, T, C = x.shape
+        K, H, hd, d = self.K, self.H, self.hd, self.d
+        Lc = self.chunk
+        S = torch.zeros(B * K, H, hd, hd, dtype=torch.float32,
+                        device=x.device)
+        outs = []
+        for c0 in range(0, T, Lc):
+            e = min(c0 + Lc, T)
+            sl = slice(c0, e)
+            briefs = None
+            if self.brief:
+                S0 = S[None]                  # one "chunk": current state
+                briefs = self._briefings(S0, B, e - c0)
+            o_c, S_end = delta_scan_chunk(
+                q[:, :, sl], k[:, :, sl], v[:, :, sl],
+                beta[:, :, sl], la[:, :, sl], s0=S, L=Lc)
+            o_pop_c = None
+            if pop_q is not None:
+                o_pop_c, _ = delta_scan_chunk(
+                    pop_q[:, :, sl], k[:, :, sl], v[:, :, sl],
+                    beta[:, :, sl], la[:, :, sl], s0=S, L=Lc)
+            out_c, msg = self._emit(
+                x[:, sl], o_c, o_pop_c, briefs,
+                mask[:, sl] if mask is not None else None,
+                r_gate[:, sl] if r_gate is not None else None,
+                k_now, diag)
+            outs.append(out_c)
+            mm = self.ln_commit(msg.mean(dim=2))          # (B,K,d)
+            kv = self.w_commit(mm[:, :, None, :]).squeeze(2)
+            kc = F.normalize(F.silu(
+                kv[..., :d].float().reshape(B * K, H, hd)), dim=-1)
+            vc = kv[..., d:].float().reshape(B * K, H, hd)
+            bc = torch.sigmoid(self.commit_b.float())[None].expand(
+                B, K, H).reshape(B * K, H)
+            Sf = S_end.to(torch.float32)
+            kS = torch.einsum("nhk,nhkv->nhv", kc, Sf)
+            S = Sf + bc[..., None, None] * (
+                kc[..., :, None] * (vc - kS)[..., None, :])
+        return torch.cat(outs, dim=1)
 
 
     def _forward_packed(self, x, xi, r_sig, kk):
@@ -646,7 +843,34 @@ def deltamachines_score_flops(cfg, T):
               + d * C)                 # w_o
     scan = 12 * d * cfg.fs_chunk + 18 * d * hd
     score = K * frac * scan
+    # ---- v3.1 mechanisms (charged at the CHEAP-tier cost a packed
+    # implementation would pay; the dense probe overpays wallclock but
+    # the contract currency is these charged FLOPs)
+    pop = getattr(cfg, "fs_pop_read", False)
+    brief = getattr(cfg, "fs_brief", False)
+    mag = getattr(cfg, "fs_mag_topk", False)
+    commit = getattr(cfg, "fs_conf_commit", False)
+    L = cfg.fs_chunk
+    if pop:
+        # shared-query read of ALL K memories (read half of the scan
+        # convention) + w_out readout on unrouted views (add back what
+        # the sparsity credit below removes) — no MLP on pop views
+        score += K * (6 * d * L + 9 * d * hd)
+        score += 6 * (1 - frac) * K * (d * d)
+        if getattr(cfg, "fs_dm_conf", True):
+            score += 6 * (1 - frac) * K * conf_p   # all K views confer
+    if mag:
+        score += 6 * (1 - frac) * K * (d * C)      # all K w_o candidates
     if getattr(cfg, "fs_dm_conf", True):
-        score += 12 * d * k_act * k_act
+        n_q = K if pop else k_act
+        n_kv = n_q + (K if brief else 0)
+        score += 12 * d * n_q * n_kv
+        if brief:
+            # briefing views: per-chunk probe readout + their k/v
+            # projections, amortized over the chunk
+            score += K * (6 * d * hd + 12 * d * d) / L
+        if commit:
+            # per-chunk message mean, commit projections, rank-1 write
+            score += K * (12 * d * d + 18 * d * hd) / L
     score -= 6 * (1 - frac) * K * p_priv
     return score

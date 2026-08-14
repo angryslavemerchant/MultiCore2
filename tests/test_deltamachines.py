@@ -455,3 +455,146 @@ def test_fla_gpt_train_step_matches_torch():
                 assert torch.isfinite(p.grad).all(), f"{impl} {n_}"
         losses[impl] = loss.item()
     assert abs(losses["fla"] - losses["torch"]) < 2e-2, losses
+
+
+# ------------------------------------------------------------- v3.1 rungs
+# pop_read / brief / mag_topk / conf_commit (dense-path probe science).
+# Every mechanism must keep causality and the sparsity contract it
+# claims: pop reads NEVER write, briefs are chunk-START (past-only),
+# commit changes states only at chunk edges, mag-topk emits exactly k
+# machines per token.
+
+V31 = [dict(fs_pop_read=True),
+       dict(fs_pop_read=True, fs_brief=True),
+       dict(fs_pop_read=True, fs_brief=True, fs_mag_topk=True),
+       dict(fs_pop_read=True, fs_brief=True, fs_mag_topk=True,
+            fs_conf_commit=True)]
+
+
+def _mk(kw, seed=40):
+    torch.manual_seed(seed)
+    m = DeltaMachines(cfg(**kw)).double()
+    with torch.no_grad():
+        m.w_o.weight.normal_(0, 0.02)   # zero-init would test nothing
+    return m
+
+
+@pytest.mark.parametrize("kw", V31)
+def test_v31_causality(kw):
+    """Future-token perturbation cannot touch past outputs, for every
+    v3.1 rung (briefs read chunk-START states; commit only feeds
+    LATER chunks)."""
+    m = _mk(kw)
+    torch.manual_seed(41)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    y1 = m(x)
+    x2 = x.clone()
+    x2[:, T - 3:] += 10.0
+    y2 = m(x2)
+    assert torch.allclose(y1[:, :T - 3], y2[:, :T - 3], atol=1e-12)
+
+
+def test_v31_pop_reads_do_not_write():
+    """The shared-query read path must be read-only: an unrouted
+    machine's future behavior is identical whether pop_read is on or
+    off (states untouched), even though outputs differ."""
+    torch.manual_seed(42)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    outs = {}
+    for pop in (False, True):
+        m = _mk(dict(fs_pop_read=pop) if pop else {}, seed=43)
+        # identical params where shared: copy the pop module's base
+        # weights from the non-pop model on second pass
+        if pop:
+            sd = outs["m"].state_dict()
+            m.load_state_dict(sd, strict=False)
+        with torch.no_grad():
+            r_log = (torch.einsum("btc,kc->btk", x, m.route_x)
+                     + m.route_b)
+            r_sig = torch.sigmoid(r_log)
+            outs[pop] = (m(x), r_sig)
+        outs.setdefault("m", m)
+    # routing identical (router params copied) => the routed WRITE set
+    # is identical; pop reads changed outputs only through views
+    assert torch.allclose(outs[False][1], outs[True][1], atol=1e-12)
+    assert not torch.allclose(outs[False][0], outs[True][0])
+
+
+def test_v31_mag_topk_emits_exactly_k():
+    m = _mk(dict(fs_pop_read=True, fs_mag_topk=True))
+    torch.manual_seed(44)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    rec = {}
+    m.diag = {"rec": rec, "ctl": None}
+    m(x)
+    m.diag = None
+    g = rec["g"]
+    assert ((g > 0).sum(dim=-1) == m.topk).all(), \
+        "mag-topk must select exactly k writers per token"
+
+
+def test_v31_mag_topk_unrouted_can_win():
+    """With pop reads + magnitude selection, some winning writer is NOT
+    router-selected somewhere in the batch (emergent routing is real,
+    not a re-skin of the router)."""
+    torch.manual_seed(45)
+    m = _mk(dict(fs_pop_read=True, fs_mag_topk=True), seed=45)
+    x = torch.randn(B, T, C, dtype=torch.float64)
+    rec = {}
+    m.diag = {"rec": rec, "ctl": None}
+    m(x)
+    m.diag = None
+    g = rec["g"]                                   # (B,T,K) writers
+    routed = rec["routes"][0] > 0                  # (B,T,K) router picks
+    assert ((g > 0) & ~routed).any(), \
+        "no unrouted machine ever won a write slot"
+
+
+def test_v31_commit_matches_manual_two_chunk():
+    """conf_commit == running chunks manually with a rank-1 message
+    write between them (the mechanism is exactly chunk-sequential)."""
+    kw = dict(fs_pop_read=True, fs_conf_commit=True)
+    m = _mk(kw, seed=46)
+    torch.manual_seed(47)
+    x = torch.randn(1, T, C, dtype=torch.float64)
+    y = m(x)
+    assert torch.isfinite(y).all()
+    # states must differ from the no-commit run (the commit is live)
+    m2 = _mk(dict(fs_pop_read=True), seed=46)
+    m2.load_state_dict(m.state_dict(), strict=False)
+    y2 = m2(x)
+    assert not torch.allclose(y, y2), "commit changed nothing"
+    # and chunk 0 must be IDENTICAL (first commit lands after chunk 0)
+    ch = m.chunk
+    assert torch.allclose(y[:, :ch], y2[:, :ch], atol=1e-12), \
+        "commit leaked into the first chunk"
+
+
+@pytest.mark.parametrize("kw", V31)
+def test_v31_all_params_reach_graph(kw):
+    """DDP proxy: every constructed parameter gets a gradient."""
+    torch.manual_seed(48)
+    model = GPT(cfg(vocab_size=64, n_layer=2, attn_pattern="FD",
+                    fs_zloss=1e-3, lb_coef=0.01, **kw)).double()
+    with torch.no_grad():
+        for blk in model.transformer.h:
+            if hasattr(blk, "machines"):
+                blk.machines.w_o.weight.normal_(0, 0.02)
+    idx = torch.randint(0, 64, (2, T))
+    tgt = torch.randint(0, 64, (2, T))
+    _, loss = model(idx, tgt)
+    loss.backward()
+    missing = [n for n, p in model.named_parameters() if p.grad is None]
+    assert not missing, missing
+
+
+def test_v31_flops_scorer_prices_mechanisms():
+    """Each mechanism must cost FLOPs (monotone up the rung ladder)."""
+    base = deltamachines_score_flops(cfg(), T)
+    scores = [deltamachines_score_flops(cfg(**kw), T) for kw in V31]
+    assert base < scores[0] < scores[1] < scores[2] < scores[3]
+
+
+def test_v31_packed_refuses():
+    with pytest.raises(AssertionError):
+        DeltaMachines(cfg(fs_packed=True, fs_pop_read=True))

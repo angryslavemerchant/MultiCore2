@@ -181,6 +181,16 @@ class GPTConfig:
     fs_scan: str = "auto"      # packed-scan impl: "fla" (fused varlen
                                # kernel, CUDA) | "torch" (exact oracle,
                                # CPU-capable) | "auto" = fla if available
+    # v3.1 mechanisms (2026-08-14, dense-path probe science; see
+    # core/deltamachines.py __init__ for semantics). All default off.
+    fs_pop_read: bool = False  # shared-query reads of ALL K memories;
+                               # conference widens to all K views
+    fs_brief: bool = False     # per-chunk private state briefings join
+                               # the conference (attend-only)
+    fs_mag_topk: bool = False  # residual writes = top-k by magnitude
+                               # (emergent write routing; needs pop_read)
+    fs_conf_commit: bool = False  # conference messages committed into
+                               # states at chunk edges (rank-1 write)
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)
