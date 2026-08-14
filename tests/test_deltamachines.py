@@ -22,6 +22,7 @@ from core.model import GPT, GPTConfig                          # noqa: E402
 from core.deltamachines import (DeltaMachines, DeltaMachineBlock,
                                 delta_scan_reference,
                                 delta_scan_chunk,
+                                delta_scan_packed,
                                 deltamachines_score_flops)     # noqa: E402
 
 torch.manual_seed(0)
@@ -81,6 +82,39 @@ def test_hold_equals_skip():
         beta[:, :, keep], la[:, :, keep], L=8)
     assert torch.allclose(o_full[:, :, keep], o_pack, atol=1e-10)
     assert torch.allclose(s_full, s_pack, atol=1e-10)
+
+
+def test_packed_scan_matches_per_segment_oracle():
+    """Machine-major packed scan == the sequential oracle run on each
+    segment separately — ragged segment lengths crossing chunk
+    boundaries, empty segments included. fp64, L=8."""
+    torch.manual_seed(5)
+    lens = [3, 0, 17, 8, 1, 0, 24, 5]        # 8 segments, 58 rows
+    n, H, d = sum(lens), 2, 8
+    seg = torch.cat([torch.full((ln,), i, dtype=torch.int64)
+                     for i, ln in enumerate(lens)])
+    q = torch.randn(n, H, d, dtype=torch.float64)
+    k = torch.randn(n, H, d, dtype=torch.float64)
+    k = k / k.norm(dim=-1, keepdim=True)
+    v = torch.randn(n, H, d, dtype=torch.float64)
+    beta = torch.rand(n, H, dtype=torch.float64) * 0.9
+    la = -torch.rand(n, H, dtype=torch.float64) * 0.15
+    o, S = delta_scan_packed(q, k, v, beta, la, seg, len(lens), L=8)
+    off = 0
+    for i, ln in enumerate(lens):
+        if ln == 0:
+            assert torch.equal(S[i], torch.zeros_like(S[i]))
+            continue
+        sl = slice(off, off + ln)
+        # oracle wants (N,H,T,*) layout
+        o_ref, s_ref = delta_scan_reference(
+            q[sl].transpose(0, 1)[None], k[sl].transpose(0, 1)[None],
+            v[sl].transpose(0, 1)[None], beta[sl].t()[None],
+            la[sl].t()[None])
+        assert torch.allclose(o[sl].transpose(0, 1), o_ref[0],
+                              atol=1e-10), f"seg {i} outputs"
+        assert torch.allclose(S[i], s_ref[0], atol=1e-10), f"seg {i} state"
+        off += ln
 
 
 def test_block_causality():
@@ -243,6 +277,44 @@ def test_probe_rungs_all_params_reach_the_graph():
         (out.square().sum() + m.lb_loss + m.z_loss).backward()
         for n, p in m.named_parameters():
             assert p.grad is not None, (kw, n)
+
+
+def test_packed_matches_dense_masked_all_rungs():
+    """The hard gate: sparse execution == dense-masked semantics, every
+    rung, outputs at 1e-10 in fp64 (CPU path = grouped_mm_reference)."""
+    for kw in RUNGS:
+        torch.manual_seed(21)
+        m = DeltaMachines(cfg(**kw)).double()
+        m.eval()
+        with torch.no_grad():
+            m.w_o.weight.normal_(0, 0.02)
+        x = torch.randn(B, T, C, dtype=torch.float64)
+        with torch.no_grad():
+            dense = m(x)
+            m.packed = True
+            packed = m(x)
+            m.packed = False
+        assert torch.allclose(dense, packed, atol=1e-10), kw
+
+
+def test_packed_matches_dense_gradients():
+    """Backward equivalence on the full rung: every parameter's grad
+    matches between dense-masked and packed execution."""
+    grads = []
+    for use_packed in (False, True):
+        torch.manual_seed(22)
+        m = DeltaMachines(cfg()).double()
+        m.packed = use_packed
+        with torch.no_grad():
+            m.w_o.weight.normal_(0, 0.02)
+        torch.manual_seed(23)
+        x = torch.randn(B, T, C, dtype=torch.float64)
+        (m(x).square().sum() + m.lb_loss + m.z_loss).backward()
+        grads.append({n_: p.grad.clone()
+                      for n_, p in m.named_parameters()})
+    for n_ in grads[0]:
+        assert torch.allclose(grads[0][n_], grads[1][n_],
+                              atol=1e-9), n_
 
 
 def test_probe_rungs_flops_monotone():

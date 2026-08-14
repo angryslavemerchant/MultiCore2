@@ -175,6 +175,9 @@ class GPTConfig:
     fs_dm_mlp: bool = True     # private per-machine MLPs
     fs_dm_conf: bool = True    # conference over active views
     fs_dm_gate: bool = True    # learned write gate (off = router value)
+    fs_packed: bool = False    # sparse execution: grouped GEMMs + packed
+                               # scan over routed rows only (needs
+                               # fs_topk; equivalence-tested vs dense)
     # Frankenstein stack (2026-07-30). Every default is OFF so earlier
     # arms' checkpoint configs round-trip unchanged.
     norm: str = "ln"           # "ln" (GPT-2) | "rms" (weight only, no bias)

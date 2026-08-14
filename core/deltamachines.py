@@ -90,7 +90,14 @@ def delta_scan_reference(q, k, v, beta, la, s0=None):
 def delta_scan_chunk(q, k, v, beta, la, s0=None, L=64):
     """Chunkwise-parallel gated delta scan (UT transform, module
     docstring). Same contract as the reference; computes in
-    promote(input, fp32) and casts the output back."""
+    promote(input, fp32) and casts the output back. Autocast is
+    DISABLED inside: amp would silently downcast the state matmuls to
+    fp16/bf16, breaking the fp32-state guarantee."""
+    with torch.autocast(q.device.type, enabled=False):
+        return _scan_chunk_inner(q, k, v, beta, la, s0, L)
+
+
+def _scan_chunk_inner(q, k, v, beta, la, s0, L):
     N, H, T, dk = k.shape
     dv = v.shape[-1]
     dt = torch.promote_types(q.dtype, torch.float32)
@@ -117,6 +124,84 @@ def delta_scan_chunk(q, k, v, beta, la, s0=None, L=64):
         S = (torch.exp(cl[..., -1])[..., None, None]
              * (S + Kc.transpose(-2, -1) @ W))
     return torch.cat(outs, dim=2).to(q.dtype), S
+
+
+def delta_scan_packed(q, k, v, beta, la, seg, n_seg, L=64):
+    """Packed gated-delta scan over MACHINE-MAJOR flat rows (the sparse
+    fast path: only routed (token, machine) pairs exist as rows).
+
+    q, k: (n, H, dk); v: (n, H, dv); beta, la (log decay <= 0): (n, H);
+    seg: (n,) int64, NON-DECREASING segment ids in [0, n_seg); rows
+    within a segment are time-ordered. Returns o (n, H, dv) and final
+    states S (n_seg, H, dk, dv).
+
+    Same UT-transform chunkwise math as delta_scan_chunk, with two
+    segment adaptations inside each L-row chunk: (1) the intra-chunk
+    interaction matrices are masked to same-segment pairs (the
+    triangular system block-diagonalizes, so one solve still works);
+    (2) cumulative decays reset at segment starts, and each segment's
+    state picks up its own end-of-chunk decay. A segment absent from a
+    chunk keeps its state bit-exactly (matching dense-masked hold).
+    Autocast disabled inside (fp32-state guarantee, as delta_scan_chunk)."""
+    with torch.autocast(q.device.type, enabled=False):
+        return _scan_packed_inner(q, k, v, beta, la, seg, n_seg, L)
+
+
+def _scan_packed_inner(q, k, v, beta, la, seg, n_seg, L):
+    n, H, dk = k.shape
+    dv = v.shape[-1]
+    dt = torch.promote_types(q.dtype, torch.float32)
+    q_, k_, v_ = q.to(dt), k.to(dt), v.to(dt)
+    beta_, la_ = beta.to(dt), la.to(dt)
+    S = torch.zeros(n_seg, H, dk, dv, dtype=dt, device=q.device)
+    outs = []
+    for s0 in range(0, n, L):
+        e = min(s0 + L, n)
+        Lc = e - s0
+        sg = seg[s0:e]
+        Kc = k_[s0:e].transpose(0, 1)                    # (H, Lc, dk)
+        Vc = v_[s0:e].transpose(0, 1)
+        Qc = q_[s0:e].transpose(0, 1)
+        bc = beta_[s0:e].transpose(0, 1)                 # (H, Lc)
+        same = sg[:, None] == sg[None, :]                # (Lc, Lc)
+        # segment-reset cumulative log-decay: cl[i] = sum of la over this
+        # segment's rows in this chunk up to and including i
+        cg = la_[s0:e].transpose(0, 1).cumsum(-1)        # (H, Lc)
+        prev = F.pad(cg[:, :-1], (1, 0))                 # cumsum before row
+        ar = torch.arange(Lc, device=q.device)
+        firsts = torch.cat([torch.ones(1, dtype=torch.bool,
+                                       device=q.device),
+                            sg[1:] != sg[:-1]])
+        fidx = torch.cummax(torch.where(firsts, ar,
+                                        torch.zeros_like(ar)), 0).values
+        cl = cg - prev.gather(-1, fidx.expand(H, Lc))
+        A = torch.exp(cl)[..., None]                     # (H, Lc, 1)
+        U = Vc * torch.exp(-cl)[..., None]
+        S_g = S[sg]                                      # (Lc, H, dk, dv)
+        KS0 = torch.einsum("hld,lhdv->hlv", Kc, S_g)
+        M = torch.tril(bc[..., None] * (Kc @ Kc.transpose(-2, -1)),
+                       -1) * same
+        rhs = bc[..., None] * (U - KS0)
+        eye = torch.eye(Lc, dtype=dt, device=q.device)
+        W = torch.linalg.solve_triangular(eye + M, rhs, upper=False,
+                                          unitriangular=True)
+        Qt = Qc * A
+        O = (torch.einsum("hld,lhdv->hlv", Qt, S_g)
+             + (torch.tril(Qt @ Kc.transpose(-2, -1)) * same) @ W)
+        outs.append(O.transpose(0, 1))                   # (Lc, H, dv)
+        # state update: S[s] = A_end[s] * (S[s] + sum_{r in s} k_r w_r^T)
+        lasts = torch.cat([sg[1:] != sg[:-1],
+                           torch.ones(1, dtype=torch.bool,
+                                      device=q.device)])
+        a_end_seg = torch.ones(n_seg, H, dtype=dt, device=q.device)
+        a_end_seg[sg[lasts]] = torch.exp(cl)[:, lasts].transpose(0, 1)
+        a_row = a_end_seg[sg]                            # (Lc, H)
+        contrib = torch.einsum(
+            "lhk,lhv->lhkv",
+            Kc.transpose(0, 1) * a_row[..., None], W.transpose(0, 1))
+        S = S * a_end_seg[..., None, None]
+        S = S.index_add(0, sg, contrib)
+    return torch.cat(outs, dim=0).to(q.dtype), S
 
 
 class DeltaMachines(nn.Module):
@@ -178,6 +263,14 @@ class DeltaMachines(nn.Module):
         if self.topk:
             self.route_x = nn.Parameter(torch.randn(K, C) * 0.02)
             self.route_b = nn.Parameter(torch.zeros(K))
+        # packed-sparse execution (fs_packed): only routed rows exist —
+        # grouped GEMMs over machine-major flat rows + the segment-packed
+        # scan. Semantically identical to dense-masked (equivalence-
+        # tested); requires a router; dense warmup and diag hooks fall
+        # back to the dense path.
+        self.packed = getattr(cfg, "fs_packed", False)
+        if self.packed:
+            assert self.topk, "fs_packed needs fs_topk routing"
         self.lb_loss = None
         self.z_loss = None
         # diagnostics hook, same contract as MachineStrokes.diag (hooks in
@@ -191,6 +284,16 @@ class DeltaMachines(nn.Module):
     def _topk_mask(v, k):
         kth = v.topk(k, dim=-1).values[..., -1:]
         return v * (v >= kth).to(v.dtype)
+
+    @staticmethod
+    def _gmm(x, w, offs, tg, tr):
+        """Per-machine linear on machine-major flat rows: Triton grouped
+        GEMM on GPU (core/grouped_gemm.py), reference einsum on CPU."""
+        if x.is_cuda:
+            from core.grouped_gemm import grouped_mm
+            return grouped_mm(x, w, offs, tg, tr)
+        from core.grouped_gemm import grouped_mm_reference
+        return grouped_mm_reference(x, w, offs)
 
     def _heads(self, x):                      # (B,K,T,d) -> (B*K,H,T,hd)
         B, K, T, d = x.shape
@@ -251,26 +354,15 @@ class DeltaMachines(nn.Module):
             w = self.conv.kernel_size[0]
             xi = x + self.conv(
                 F.pad(x.transpose(1, 2), (w - 1, 0))).transpose(1, 2)
-        pr = self.w_in(xi)                                # (B,K,T,3d+2H)
-        q = self._heads(pr[..., :d])
-        k = self._heads(pr[..., d:2 * d])
-        v = self._heads(pr[..., 2 * d:3 * d])
-        q = F.normalize(F.silu(q), dim=-1)
-        k = F.normalize(F.silu(k), dim=-1)
-        beta = torch.sigmoid(
-            pr[..., 3 * d:3 * d + H]).permute(0, 1, 3, 2).reshape(
-            B * K, H, T)
-        la = (-(LA_TOTAL / self.chunk) * torch.sigmoid(
-            pr[..., 3 * d + H:])).permute(0, 1, 3, 2).reshape(B * K, H, T)
-        # --- route (predict-before-work; anti-collapse package) ---
+        # --- route FIRST (predict-before-work; anti-collapse package) ---
         r_gate = mask = None
+        k_now = self.topk_now if self.topk else 0
         if self.topk:
             r_log = (torch.einsum("btc,kc->btk", x, self.route_x)
                      + self.route_b)
             if self.training and self.noise:
                 r_log = r_log + torch.randn_like(r_log) * self.noise
             r_sig = torch.sigmoid(r_log)
-            k_now = self.topk_now
             r_gate = self._topk_mask(r_sig, k_now) if k_now else r_sig
             # dense warmup (k_now = 0): every machine active, sigmoid > 0
             # everywhere -> no conference masking needed (static branch,
@@ -282,6 +374,23 @@ class DeltaMachines(nn.Module):
                 f = (r_gate > 0).float().mean(dim=(0, 1))
             self.lb_loss = K * (f * r_sig.mean(dim=(0, 1))).sum()
             self.z_loss = torch.logsumexp(r_log, dim=-1).square().mean()
+            if self.packed and k_now and diag is None:
+                # sparse fast path: only routed rows are ever computed.
+                # Identical semantics (equivalence-tested); dense warmup
+                # (k_now = 0) and diag runs stay on the dense path.
+                return self._forward_packed(x, xi, r_sig, k_now)
+        pr = self.w_in(xi)                                # (B,K,T,3d+2H)
+        q = self._heads(pr[..., :d])
+        k = self._heads(pr[..., d:2 * d])
+        v = self._heads(pr[..., 2 * d:3 * d])
+        q = F.normalize(F.silu(q), dim=-1)
+        k = F.normalize(F.silu(k), dim=-1)
+        beta = torch.sigmoid(
+            pr[..., 3 * d:3 * d + H]).permute(0, 1, 3, 2).reshape(
+            B * K, H, T)
+        la = (-(LA_TOTAL / self.chunk) * torch.sigmoid(
+            pr[..., 3 * d + H:])).permute(0, 1, 3, 2).reshape(B * K, H, T)
+        if r_gate is not None:
             rk = r_gate.permute(0, 2, 1).reshape(B * K, 1, T)
             # unrouted: beta -> 0 AND log-decay -> 0 (alpha = 1): the
             # state holds bit-exactly, masking == skipping. Routed writes
@@ -324,6 +433,88 @@ class DeltaMachines(nn.Module):
                     rec["lens_wo"] = self.w_o(
                         c[:, :, rec["lens_pos"], :]).detach()
         return out
+
+
+    def _forward_packed(self, x, xi, r_sig, kk):
+        """Sparse execution: the n = B*T*kk routed (token, machine) rows,
+        MACHINE-MAJOR (stable sort by machine keeps (b, t) order inside
+        each machine — the layout both the grouped GEMMs and the packed
+        scan want). All shapes static: routing changes tensor contents,
+        never shapes."""
+        B, T, C = x.shape
+        K, d, H, hd = self.K, self.d, self.H, self.hd
+        dev = x.device
+        vals, midx = r_sig.topk(kk, dim=-1)              # (B,T,kk)
+        n = B * T * kk
+        i = torch.arange(n, device=dev)
+        b, t = i // (T * kk), (i // kk) % T
+        m = midx.reshape(-1).to(torch.int64)
+        order = torch.argsort(m, stable=True)
+        m_s, b_s, t_s = m[order], b[order], t[order]
+        bt = b_s * T + t_s                               # row -> token
+        rv = vals.reshape(-1)[order]                     # router sigmoid
+        seg = m_s * B + b_s                              # non-decreasing
+        counts = torch.bincount(m_s, minlength=K)
+        offs = torch.zeros(K + 1, dtype=torch.int32, device=dev)
+        offs[1:] = counts.cumsum(0).to(torch.int32)
+        if dev.type == "cuda":
+            from core.grouped_gemm import build_tile_map
+            tg, tr = build_tile_map(offs, 64, n // 64 + K)
+        else:
+            tg = tr = None
+        gmm = self._gmm
+        xf = xi.reshape(B * T, C).index_select(0, bt)    # (n, C)
+        pr = gmm(xf, self.w_in.weight, offs, tg, tr)     # (n, 3d+2H)
+        q = F.normalize(F.silu(pr[:, :d].view(n, H, hd)), dim=-1)
+        k = F.normalize(F.silu(pr[:, d:2 * d].view(n, H, hd)), dim=-1)
+        v = pr[:, 2 * d:3 * d].view(n, H, hd)
+        beta = torch.sigmoid(pr[:, 3 * d:3 * d + H]) * rv[:, None]
+        la = -(LA_TOTAL / self.chunk) * torch.sigmoid(pr[:, 3 * d + H:])
+        o, _ = delta_scan_packed(k=k, q=q, v=v, beta=beta, la=la,
+                                 seg=seg, n_seg=K * B, L=self.chunk)
+        s = gmm(self.ln_o(o.reshape(n, d)), self.w_out.weight,
+                offs, tg, tr)
+        if self.use_mlp:
+            h = F.relu(gmm(self.ln_mlp(s), self.mlp.fc.weight,
+                           offs, tg, tr)).square()
+            for mid in self.mlp.mids:
+                h = F.relu(gmm(h, mid.weight, offs, tg, tr)).square()
+            s = s + gmm(h, self.mlp.proj.weight, offs, tg, tr)
+        if self.use_conf:
+            sn = self.ln_iface(s)
+            qc, kc, vc = gmm(sn, self.w_qkv.weight,
+                             offs, tg, tr).split(d, dim=-1)
+            kc = self.anchor[m_s] + self.addr_mix[m_s, None] * kc
+            inv = torch.empty_like(order)
+            inv[order] = i                               # -> token-major
+
+            def tok(z):      # (n, d) -> (B*T, H, kk, hd)
+                return (z.index_select(0, inv)
+                        .view(B * T, kk, H, hd).transpose(1, 2))
+
+            sc = tok(qc) @ tok(kc).transpose(-2, -1) / math.sqrt(hd)
+            if self.conf_sink is not None:
+                sink = (self.conf_sink[None, :, None, None]
+                        .expand(B * T, -1, kk, 1))
+                a = torch.softmax(torch.cat((sc, sink), -1),
+                                  -1)[..., :kk]
+            else:
+                a = torch.softmax(sc, -1)
+            y = (a @ tok(vc)).transpose(1, 2).reshape(n, d)
+            y = y.index_select(0, order)                 # machine-major
+            c = s + gmm(y, self.conf_out.weight, offs, tg, tr)
+        else:
+            c = s
+        if self.use_gate:
+            xr = x.reshape(B * T, C).index_select(0, bt)  # gate reads RAW x
+            g = torch.sigmoid((xr * self.gate_x[m_s]).sum(-1)
+                              + (c * self.gate_c[m_s]).sum(-1)
+                              + self.gate_b[m_s]) * rv
+        else:
+            g = rv
+        wo = gmm(c, self.w_o.weight, offs, tg, tr)       # (n, C)
+        out = x.new_zeros(B * T, C).index_add(0, bt, wo * g[:, None])
+        return out.view(B, T, C)
 
 
 class DeltaMachineBlock(nn.Module):
