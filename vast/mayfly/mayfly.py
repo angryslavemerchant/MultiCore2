@@ -110,7 +110,11 @@ def run_deadman(a):
                       errors="replace") as f:
                 last = f.readlines()[-1].strip() if f else ""
         except OSError:
-            age_min, last = float("inf"), "(heartbeat file missing)"
+            # file not written yet: age from OUR start, not infinity —
+            # the watched mayfly only writes after its first poll
+            # (instant false DEADMAN observed live 2026-08-14)
+            age_min = (time.time() - t0) / 60
+            last = "(heartbeat file not created yet)"
         if "TERMINAL" in last:
             bail(0, f"DONE watched mayfly ended cleanly: {last}")
         if age_min > a.stale_min:
